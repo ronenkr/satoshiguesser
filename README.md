@@ -1,298 +1,166 @@
 # Satoshi Guesser
 
-A slot-machine web game that "guesses" Satoshi Nakamoto's Bitcoin private
-keys. The odds are astronomically remote (~1 in 5.27 × 10⁷² per spin), but
-the cryptography is real: every pull rolls a random 256-bit number, derives
-the Bitcoin address, and checks it against a curated set of ~22,000
-Patoshi-pattern coinbase addresses plus the genesis block. If the derived
-address ever matches, the random number you rolled **is** the working
-private key for that wallet — no server, no API, no catch.
+A fast Rust CLI that continuously guesses random Bitcoin private keys and
+checks both P2PKH address forms against the Satoshi/Patoshi address set in
+`data/wallets.csv`.
 
-Live at **[satoshiguesser.com](https://satoshiguesser.com)** (when deployed).
+The odds are still astronomically remote. This is a compute experiment, not a
+practical way to recover coins.
 
----
+## Build
 
-## How it works (no blockchain required)
-
-Bitcoin's address derivation is a one-way deterministic chain:
-
-```
-random 256-bit number  ──►  secp256k1 public key  ──►  HASH160  ──►  Base58Check address
-   (private key)              (point on curve)         (RIPEMD160(SHA256))
-```
-
-Every Bitcoin address has exactly one private key that controls it. So when
-the game generates a random 256-bit number, that number **is** a valid
-private key — it just controls some random address with (almost certainly)
-zero balance. If that derived address ever matches one of Satoshi's, the
-random number is the private key to that wallet, full stop. The math is
-the verification.
-
-What ships with the page (at build time):
-
-1. The set of Satoshi-attributed addresses, as a Bloom filter for fast
-   lookup (~135 KB) plus a sorted (hash160, balance_sats) table for prize
-   readout (~615 KB, lazy-loaded only on a Bloom hit).
-2. A hardcoded BTC/USD constant with a snapshot date.
-
-Nothing else. No node connection, no API call, no telemetry.
-
----
-
-## Features
-
-- **Two reel modes:** classic 3-reel ✗/✓, or "realistic" 64 hex cells that
-  reveal the full candidate private key with red/green flash on result.
-- **No-delay toggle:** skip animations, snap results in synchronously.
-  Spam-clickable as fast as your finger goes (~2,500 spins/sec headroom).
-- **Autospin:** chains spins automatically. 250 ms between spins normally;
-  drops to 16 ms (one paint frame) when no-delay is also on. Auto-pauses
-  on win.
-- **Live header:** jackpot in BTC and USD, per-spin odds, wallet count,
-  price snapshot date, "Win up to X billion dollars!" tagline (computed,
-  not hardcoded).
-- **Win UX:** modal with the matched address, the WIF private key, the
-  prize in BTC and USD, "Copy" button, confetti, and a win-arpeggio sound.
-- **Dev-win flag:** append `?devwin=1` to the URL to force a "win" against
-  the genesis address. The shown WIF won't actually unlock anything (we
-  don't have Satoshi's key) — it's purely for verifying the win UI.
-- **Synthesised audio:** lever click, reel-stop tick, lose thunk, win
-  arpeggio. Generated via Web Audio API — no asset downloads.
-- **Spacebar** also pulls the lever.
-
----
-
-## Quick start
-
-Requires Node 22 or newer.
+Requires a recent stable Rust toolchain.
 
 ```bash
-npm install
-npm run dev          # http://localhost:5173
+cargo build --release
 ```
 
-The `predev` hook regenerates `public/data/satoshi-bloom.bin`,
-`satoshi-wallets.bin`, and `wallet-stats.json` from `data/wallets.csv` on
-every dev start, so editing the CSV propagates automatically.
+Release builds use `target-cpu=native`, so build on the server that will run the
+binary. That lets LLVM emit instructions for available CPU features such as
+AVX2, SSE4.1, SHA-NI, and their ARM equivalents. On non-MSVC targets, the
+`sha2` assembly backend is also enabled for SHA acceleration; MSVC builds use
+RustCrypto's runtime-detected SHA intrinsics instead. The wallet CSV is embedded
+into the binary at compile time by default, so the release executable does not
+need extra data files.
+
+## Run
 
 ```bash
-npm run build        # production bundle in dist/
-npm run preview      # serve dist/ for a final smoke test
-npm test             # 11 unit/integration tests
+./target/release/satoshi-guesser
 ```
 
----
+On Windows:
 
-## Project layout
-
-```
-SatoshiGuesser/
-├── index.html                    # single page, no framework
-├── src/
-│   ├── main.js                   # app entry: wires UI, audio, game loop
-│   ├── game/
-│   │   ├── crypto.js             # privkey → secp256k1 → HASH160 → P2PKH; WIF
-│   │   ├── bloom.js              # Bloom filter (serialise + has/add)
-│   │   ├── wallet-table.js       # sorted (hash160, balance) binary search
-│   │   ├── wallets.js            # lazy-loads bloom + table; checkHash160s()
-│   │   └── spin.js               # one-spin pipeline; supports devwin override
-│   ├── ui/
-│   │   ├── log.js                # rolling log textarea
-│   │   ├── slot-classic.js       # 3-reel ✗/✓ animation
-│   │   ├── slot-realistic.js     # 64 hex cells with red/green flash
-│   │   └── win-dialog.js         # modal + confetti + clipboard
-│   ├── audio/audio.js            # Web Audio synthesised SFX
-│   └── styles/{main,slot}.css
-├── data/
-│   └── wallets.csv               # canonical input — 21,954 addresses + balances
-├── scripts/
-│   ├── fetch-patoshi.js          # downloads bensig CSV → data/wallets.csv
-│   ├── build-wallet-set.js       # data/wallets.csv → public/data/*.bin
-│   └── bench-spin.js             # microbench (per-spin cost)
-├── public/
-│   ├── data/                     # generated artifacts (gitignored)
-│   └── audio/                    # reserved for future audio assets
-├── tests/
-│   ├── crypto.test.js            # known privkey/pubkey/WIF vectors + genesis
-│   ├── wallets.test.js           # bloom + table round-trip
-│   └── spin.test.js              # end-to-end-ish miss/hit
-├── PLAN.md                       # original design plan
-└── package.json
+```powershell
+.\target\release\satoshi-guesser.exe
 ```
 
----
+By default the program uses all available CPU cores and prints one stats line
+every 5 seconds:
 
-## The wallet dataset
+```text
+stats elapsed=5s total_guesses=1234567 guesses_per_second=246913 average_guesses_per_second=246913
+```
 
-`data/wallets.csv` is the canonical input. Format:
+At startup it also prints detected CPU features, for example:
+
+```text
+loaded 21954 targets (... BTC); starting 32 worker threads; cpu_features=sse2,ssse3,sse4.1,avx2,sha-ni
+```
+
+Useful options:
+
+```text
+--threads N             number of worker threads, default: all logical cores
+--stats-seconds N       stats interval, default: 5
+--targets wallets.csv   load a CSV at runtime instead of the embedded file
+--success-file path     where to write a hit, default: satoshi-guesser-success.txt
+--compressed-only       only check compressed public-key addresses
+--uncompressed-only     only check uncompressed public-key addresses
+--toy-gpu-demo          run a synthetic u64 CUDA/CPU search demo instead
+```
+
+For a dedicated server, pin the thread count to the number of cores you want to
+burn:
+
+```bash
+./target/release/satoshi-guesser --threads 32
+```
+
+## What It Does
+
+Each worker thread:
+
+1. Seeds a per-thread ChaCha20 CSPRNG from the OS RNG.
+2. Generates a random 256-bit candidate private key.
+3. Rejects the tiny fraction of candidates outside the secp256k1 private-key
+   range.
+4. Derives the secp256k1 public key.
+5. Computes HASH160 for compressed and uncompressed public keys.
+6. Binary-searches the embedded sorted target set.
+
+The global guess counter is batched to reduce atomic contention. The hot path
+does not allocate.
+
+If a hit ever occurs, the process stops all workers, prints the private key hex
+and WIF, matched address, balance, address form, and total guess count, then
+writes the same result to `satoshi-guesser-success.txt` unless `--success-file`
+points somewhere else.
+
+## Synthetic CUDA Demo
+
+The real Bitcoin-address search path is CPU-only. For testing your Tesla P40s,
+there is a separate synthetic demo that searches an internally generated `u64`
+nonce space. It does not use `data/wallets.csv`, Bitcoin addresses, secp256k1,
+or private keys.
+
+On Ubuntu with the NVIDIA driver and CUDA toolkit installed:
+
+```bash
+cargo build --release --features cuda-toy
+```
+
+Tesla P40 is compute capability 6.1, so the default CUDA architecture is
+`sm_61`. To override it:
+
+```bash
+CUDA_ARCH=sm_61 cargo build --release --features cuda-toy
+```
+
+Run CPU workers plus all detected CUDA devices:
+
+```bash
+./target/release/satoshi-guesser --toy-gpu-demo --threads "$(nproc)"
+```
+
+For a quick smoke test:
+
+```bash
+./target/release/satoshi-guesser --toy-gpu-demo --threads 4 --toy-target-nonce 100000000
+```
+
+Toy CUDA tuning flags:
+
+```text
+--toy-target-nonce N    synthetic nonce to find, default: 500000000
+--toy-cuda-blocks N     CUDA blocks per launch, default: 1024
+--toy-cuda-threads N    CUDA threads per block, default: 256
+--toy-cuda-iters N      loop iterations per CUDA thread, default: 256
+```
+
+If the binary was not compiled with `--features cuda-toy`, the toy mode still
+runs on CPU and prints a message explaining how to enable CUDA.
+
+## Data
+
+`data/wallets.csv` contains the Patoshi-pattern coinbase outputs plus the
+genesis address. The expected CSV format is:
 
 ```csv
-# comments OK; blank lines OK
-address,balance_btc[,note]
-1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa,50.0,Genesis
-12c6DSiU4Rq3P4ZxziKxzrL5LmMBrzjrJX,50.0
-1HLoD9E4SDFFPDiYfNYnkBLQ85Y51J3Zb1     # balance defaults to 50 BTC
+address,balance_btc
+1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa,50.00000000
 ```
 
-The current file holds **21,954 unique addresses** totalling
-**1,097,702.49 BTC** — 21,953 Patoshi-pattern coinbase outputs plus the
-genesis block.
-
-### Regenerating from upstream
-
-```bash
-npm run fetch:patoshi      # downloads + converts P2PK → P2PKH addresses
-npm run build:wallets      # rebuilds bloom + sorted table
-```
-
-The fetcher pulls
-[bensig/patoshi-addresses](https://github.com/bensig/patoshi-addresses)
-(curated by Sergio Demian Lerner / Jameson Lopp), hex-decodes each P2PK
-uncompressed public key to its P2PKH address, aggregates by address (in
-case any two coinbases share a key), appends the genesis address as a
-supplement, and writes a sorted, self-documenting CSV.
-
-### Build-time artifacts
-
-`scripts/build-wallet-set.js` emits three files into `public/data/` (all
-gitignored — they're rebuilt from `wallets.csv`):
-
-| File                  | Format                                                   | Size  |
-| --------------------- | -------------------------------------------------------- | ----- |
-| `satoshi-bloom.bin`   | Bloom filter, m=1,078,320 bits, k=30, p≈10⁻⁹             | 135 KB |
-| `satoshi-wallets.bin` | Sorted `(hash160, balance_sats)` table, 28 bytes/entry   | 615 KB |
-| `wallet-stats.json`   | Counts, totals, BTC/USD price, snapshot date             | < 1 KB |
-
-The Bloom filter is sized for 25,000 entries to leave headroom for future
-updates without changing the FP rate.
-
----
-
-## Configuration
-
-Two constants live in `scripts/build-wallet-set.js`:
-
-```js
-const BTC_USD_APPROX = 76_228.52;      // refresh near deploy time
-const PRICE_SNAPSHOT_DATE = …;          // auto-set to build date
-```
-
-Refresh the price, run `npm run build:wallets` (or just rebuild — `prebuild`
-runs it), and the header strip + tagline update automatically.
-
-The autospin delays live in `src/main.js`:
-
-```js
-const AUTOSPIN_DELAY_MS = 250;          // normal autospin pacing
-const AUTOSPIN_DELAY_NO_DELAY_MS = 16;  // when "No delay" is also on
-```
-
----
+Only mainnet P2PKH addresses are loaded.
 
 ## Tests
 
 ```bash
-npm test
+cargo test
 ```
 
-11 tests covering:
+The tests cover Base58Check address decoding, BTC-to-sats parsing, the embedded
+target set, and a known private-key-to-HASH160 vector.
 
-- known privkey → pubkey → P2PKH address vectors (Bitcoin wiki test vectors)
-- WIF encoding (uncompressed and compressed)
-- HASH160 round-trip
-- Bloom filter add / has + serialise / deserialise
-- Sorted table binary-search hit and miss
-- End-to-end miss path (random key against the real bloom)
-- Planted hit path (genesis hash160 → balance)
+## Performance Notes
 
----
+Use `--release`. Debug builds are intentionally much slower.
 
-## Performance
+The bottleneck is secp256k1 public-key derivation, so throughput scales mostly
+with CPU cores. SHA-256 uses the assembly backend when the CPU supports it; the
+target lookup is a sorted in-memory binary search over about 22k HASH160 values
+and is tiny compared with elliptic-curve work.
 
-Benchmark (`npm run bench` — well, `node scripts/bench-spin.js`):
-
-```
-spins:                 5000
-address set size:      134790 bytes (1078320 bits, k=30)
-bloom hits (FPs):      0
-derive (secp+hash):    avg 0.391 ms/spin
-bloom check (×2):      avg 0.004 ms/spin
-total per spin:        avg 0.396 ms/spin
-throughput:            ~2490 spins/sec
-```
-
-The Bloom check is **independent of address-set size** — k=30 hash lookups
-regardless of n. 99% of per-spin cost is the elliptic-curve point
-multiplication. The data set could grow 100× and you'd notice the page
-being heavier on first load and absolutely nothing else at runtime.
-
----
-
-## Deploy to Cloudflare Pages
-
-This is a static site — no Workers, no Durable Objects, no R2.
-
-### Path A — Pages + Git (recommended)
-
-1. Push the repo to GitHub.
-2. Cloudflare dashboard → **Workers & Pages** → **Create** → **Pages** → connect repo.
-3. Build settings:
-   - Build command: `npm run build`
-   - Build output directory: `dist`
-   - Root directory: (blank)
-4. Save and deploy. Auto-redeploys on every push.
-5. **Custom domain** → add `satoshiguesser.com` and `www.satoshiguesser.com`. If the
-   domain is in your Cloudflare account, DNS auto-wires.
-
-### Path B — Wrangler direct upload
-
-```bash
-npm install -D wrangler
-npx wrangler login
-npm run build
-npx wrangler pages deploy dist --project-name satoshi-guesser
-```
-
-### Pre-flight
-
-- `data/wallets.csv` is committed (build needs it).
-- `public/data/*.bin` and `wallet-stats.json` are gitignored — they
-  regenerate via the `prebuild` hook in CI.
-- Node 22 LTS or newer (Pages default works).
-
----
-
-## The odds, for context
-
-```
-keyspace        = 2^256              ≈ 1.158 × 10⁷⁷ valid private keys
-satoshi addrs   = 21,954
-odds per spin   = 21,954 / 2^256     ≈ 1 in 5.27 × 10⁷²
-```
-
-For scale: about **10 million times harder** than picking one specific
-atom from the entire observable universe. At one spin per millisecond
-(faster than this app runs), you'd expect a hit roughly once per
-1.7 × 10⁶² years — about 10⁵² times the current age of the universe. The
-heat death of the universe occurs first, by a comically wide margin.
-
----
-
-## Credits
-
-- **Sergio Demian Lerner** — discoverer of the Patoshi pattern.
-- **Jameson Lopp** — curated dataset.
-- **[bensig/patoshi-addresses](https://github.com/bensig/patoshi-addresses)**
-  — distribution of the curated CSV used by the fetch script.
-- **[@noble/secp256k1](https://github.com/paulmillr/noble-secp256k1),
-  [@noble/hashes](https://github.com/paulmillr/noble-hashes),
-  [@scure/base](https://github.com/paulmillr/scure-base)** — Paul Miller's
-  audited, dependency-free crypto primitives.
-- **[canvas-confetti](https://github.com/catdad/canvas-confetti)** — the
-  confetti.
-
----
-
-## License
-
-MIT
+If you need a portable binary for mixed CPU generations, remove
+`.cargo/config.toml` or replace `target-cpu=native` with a baseline CPU before
+building.

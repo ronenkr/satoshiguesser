@@ -1,16 +1,6 @@
-node_modules/
-dist/
-.DS_Store
+target/
 *.log
-.vite/
-public/data/satoshi-wallets.bin
-public/data/satoshi-bloom.bin
-public/data/wallet-stats.json
-.claude/settings.local.json
-
-# wrangler files
-.wrangler
-.dev.vars*
-!.dev.vars.example
+.DS_Store
 .env*
 !.env.example
+.claude/settings.local.json
