@@ -230,18 +230,21 @@ cargo build --release --features opencl-toy
 ./target/release/satoshi-guesser --opencl-key-benchmark
 ```
 
-This starts conservatively with one OpenCL work item and one full key per
-launch. That avoids `CL_OUT_OF_RESOURCES` on smaller iGPUs and older drivers.
-Increase the batch only after the baseline works:
+This starts conservatively with one OpenCL work item and 16 full keys per
+launch. That avoids `CL_OUT_OF_RESOURCES` on smaller iGPUs and older drivers
+while amortizing the starting scalar multiplication. Increase the batch only
+after the baseline works:
 
 ```bash
-./target/release/satoshi-guesser --opencl-key-benchmark --opencl-key-global 2 --opencl-key-local 1 --opencl-key-iters 1
+./target/release/satoshi-guesser --opencl-key-benchmark --opencl-key-global 2 --opencl-key-local 1 --opencl-key-iters 16
 ```
 
 This mode runs only OpenCL GPU workers. For each counted key, the OpenCL kernel
-derives deterministic private-key material, performs secp256k1 generator scalar
-multiplication, serializes a compressed public key, computes SHA-256 and
-RIPEMD-160, and compares the resulting HASH160 to a synthetic in-program target.
+scans a deterministic synthetic keyspace, derives valid secp256k1 public keys,
+serializes compressed public keys, computes SHA-256 and RIPEMD-160, and compares
+the resulting HASH160 values to a synthetic in-program target. The kernel
+computes a starting point once per work item, then advances through the keyspace
+with elliptic-curve point addition.
 It prints `opencl_key_stats` every 5 seconds:
 
 ```text
@@ -257,7 +260,7 @@ Full OpenCL key benchmark tuning flags:
 ```text
 --opencl-key-global N   OpenCL work-items per launch, default: 1
 --opencl-key-local N    OpenCL local work-items per group, default: 1
---opencl-key-iters N    full keys per OpenCL work-item, default: 1
+--opencl-key-iters N    full keys per OpenCL work-item, default: 16
 ```
 
 If the driver reports `clFinish failed: -5`, that is OpenCL

@@ -269,11 +269,26 @@ static int scalar_bit(const uint k[8], int bit) {
     return (int)((k[bit >> 5] >> (bit & 31)) & 1u);
 }
 
+static void scalar_from_u64(uint k[8], ulong value) {
+    zero8(k);
+    k[0] = (uint)value;
+    k[1] = (uint)(value >> 32);
+    if (is_zero8(k)) k[0] = 1u;
+}
+
 static void scalar_from_index(uint k[8], ulong index) {
-    for (int i = 0; i < 4; i++) {
-        ulong v = mix64(index + (ulong)i * 0x9e3779b97f4a7c15UL);
-        k[i * 2] = (uint)v;
-        k[i * 2 + 1] = (uint)(v >> 32);
+    k[0] = 0x10203040u; k[1] = 0x50607080u; k[2] = 0x90a0b0c0u; k[3] = 0xd0e0f001u;
+    k[4] = 0x12345678u; k[5] = 0x9abcdef0u; k[6] = 0x0fedcba9u; k[7] = 0x13579bdfu;
+    ulong sum = (ulong)k[0] + (uint)index;
+    k[0] = (uint)sum;
+    ulong carry = sum >> 32;
+    sum = (ulong)k[1] + (uint)(index >> 32) + carry;
+    k[1] = (uint)sum;
+    carry = sum >> 32;
+    for (int i = 2; i < 8 && carry != 0UL; i++) {
+        sum = (ulong)k[i] + carry;
+        k[i] = (uint)sum;
+        carry = sum >> 32;
     }
     k[7] &= 0x7fffffffu;
     if (is_zero8(k)) k[0] = 1u;
@@ -291,6 +306,21 @@ static void scalar_mul_g(uint AX[8], uint AY[8], const uint k[8]) {
     for (int bit = 255; bit >= 0; bit--) {
         if (!inf) point_double(X, Y, Z, &inf);
         if (scalar_bit(k, bit)) point_add_mixed(X, Y, Z, &inf, gx, gy);
+    }
+
+    uint zi[8], zi2[8], zi3[8];
+    inv_mod(zi, Z);
+    sqr_mod(zi2, zi);
+    mul_mod(zi3, zi2, zi);
+    mul_mod(AX, X, zi2);
+    mul_mod(AY, Y, zi3);
+}
+
+static void normalize_point(uint AX[8], uint AY[8], const uint X[8], const uint Y[8], const uint Z[8], int inf) {
+    if (inf) {
+        zero8(AX);
+        zero8(AY);
+        return;
     }
 
     uint zi[8], zi2[8], zi3[8];
@@ -460,14 +490,26 @@ __kernel void key_benchmark(
 ) {
     ulong gid = (ulong)get_global_id(0);
     ulong work_size = (ulong)get_global_size(0);
-    ulong acc = base ^ stride ^ gid;
+    ulong step = work_size * stride;
+    ulong first_index = base + gid * stride;
+    ulong acc = base ^ stride ^ gid ^ step;
+
+    uint k[8], step_k[8], x[8], y[8], z[8], step_x[8], step_y[8];
+    uint ax[8], ay[8], sha[8], h160[5];
+    scalar_from_index(k, first_index);
+    scalar_mul_g(ax, ay, k);
+    copy8(x, ax);
+    copy8(y, ay);
+    zero8(z);
+    z[0] = 1u;
+
+    scalar_from_u64(step_k, step);
+    scalar_mul_g(step_x, step_y, step_k);
+    int inf = 0;
 
     for (uint i = 0; i < iterations_per_item; i++) {
-        ulong index = base + (gid + ((ulong)i * work_size)) * stride;
-        uint k[8], x[8], y[8], sha[8], h160[5];
-        scalar_from_index(k, index);
-        scalar_mul_g(x, y, k);
-        sha256_pubkey(x, y, sha);
+        normalize_point(ax, ay, x, y, z, inf);
+        sha256_pubkey(ax, ay, sha);
         ripemd160_sha(sha, h160);
 
         uint matched = (uint)(
@@ -478,6 +520,7 @@ __kernel void key_benchmark(
             h160[4] == target4
         );
         acc ^= ((ulong)h160[0] << 32) ^ (ulong)h160[1] ^ ((ulong)matched << 63);
+        point_add_mixed(x, y, z, &inf, step_x, step_y);
     }
 
     checksum_out[gid] = acc;
