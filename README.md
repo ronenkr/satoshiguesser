@@ -230,6 +230,14 @@ cargo build --release --features opencl-toy
 ./target/release/satoshi-guesser --opencl-key-benchmark
 ```
 
+This starts conservatively with one OpenCL work item and one full key per
+launch. That avoids `CL_OUT_OF_RESOURCES` on smaller iGPUs and older drivers.
+Increase the batch only after the baseline works:
+
+```bash
+./target/release/satoshi-guesser --opencl-key-benchmark --opencl-key-global 2 --opencl-key-local 1 --opencl-key-iters 1
+```
+
 This mode runs only OpenCL GPU workers. For each counted key, the OpenCL kernel
 derives deterministic private-key material, performs secp256k1 generator scalar
 multiplication, serializes a compressed public key, computes SHA-256 and
@@ -243,6 +251,19 @@ opencl_key_stats elapsed=5s total_keys=... keys_per_second=... average_keys_per_
 This benchmark is intentionally much slower than the synthetic `u64` toy hash
 benchmark. The implementation favors an honest full calculation over pretending
 tiny hashes are Bitcoin key guesses.
+
+Full OpenCL key benchmark tuning flags:
+
+```text
+--opencl-key-global N   OpenCL work-items per launch, default: 1
+--opencl-key-local N    OpenCL local work-items per group, default: 1
+--opencl-key-iters N    full keys per OpenCL work-item, default: 1
+```
+
+If the driver reports `clFinish failed: -5`, that is OpenCL
+`CL_OUT_OF_RESOURCES`. The worker automatically backs off larger batches; if it
+still happens at `1/1/1`, that device cannot run this intentionally heavy kernel
+as written.
 
 ## Data
 

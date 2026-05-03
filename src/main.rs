@@ -33,6 +33,9 @@ const DEFAULT_TOY_CUDA_ITERS: u32 = 256;
 const DEFAULT_TOY_OPENCL_GLOBAL_WORK_ITEMS: usize = 262_144;
 const DEFAULT_TOY_OPENCL_LOCAL_WORK_ITEMS: usize = 256;
 const DEFAULT_TOY_OPENCL_ITERS: u32 = 256;
+const DEFAULT_KEY_OPENCL_GLOBAL_WORK_ITEMS: usize = 1;
+const DEFAULT_KEY_OPENCL_LOCAL_WORK_ITEMS: usize = 1;
+const DEFAULT_KEY_OPENCL_ITERS: u32 = 1;
 const SYNTHETIC_OPENCL_TARGET_HASH160: [u32; 5] =
     [0x89abcdef, 0x01234567, 0xfedcba98, 0x76543210, 0x0badc0de];
 const SATS_PER_BTC: u64 = 100_000_000;
@@ -55,6 +58,9 @@ struct Args {
     toy_opencl_global: usize,
     toy_opencl_local: usize,
     toy_opencl_iters: u32,
+    key_opencl_global: usize,
+    key_opencl_local: usize,
+    key_opencl_iters: u32,
 }
 
 #[derive(Clone, Debug)]
@@ -249,9 +255,9 @@ fn run_opencl_key_benchmark(args: Args) {
         "opencl_key_benchmark target_hash160={} opencl_devices={} global_work_items={} local_work_items={} iterations_per_item={}",
         synthetic_opencl_target_hash160_hex(),
         opencl_devices.len(),
-        args.toy_opencl_global,
-        args.toy_opencl_local,
-        args.toy_opencl_iters
+        args.key_opencl_global,
+        args.key_opencl_local,
+        args.key_opencl_iters
     );
     for device in &opencl_devices {
         eprintln!(
@@ -268,9 +274,9 @@ fn run_opencl_key_benchmark(args: Args) {
     for (lane, device) in opencl_devices.into_iter().enumerate() {
         let worker_total = Arc::clone(&total_guesses);
         let worker_stop = Arc::clone(&stop);
-        let global_work_items = args.toy_opencl_global;
-        let local_work_items = args.toy_opencl_local;
-        let iterations_per_item = args.toy_opencl_iters;
+        let global_work_items = args.key_opencl_global;
+        let local_work_items = args.key_opencl_local;
+        let iterations_per_item = args.key_opencl_iters;
         workers.push(thread::spawn(move || {
             run_opencl_key_benchmark_worker(
                 device,
@@ -300,7 +306,7 @@ fn run_opencl_key_benchmark(args: Args) {
         let interval_rate = interval_guesses as f64 / tick_elapsed;
         let average_rate = total as f64 / elapsed.max(f64::EPSILON);
         println!(
-            "opencl_key_stats elapsed={:.0}s total_keys={} keys_per_second={:.0} average_keys_per_second={:.0}",
+            "opencl_key_stats elapsed={:.0}s total_keys={} keys_per_second={:.3} average_keys_per_second={:.3}",
             elapsed, total, interval_rate, average_rate
         );
         last_tick = now;
@@ -632,9 +638,9 @@ fn run_opencl_key_benchmark_worker(
     device: ToyOpenClDevice,
     mut base: u64,
     stride: u64,
-    global_work_items: usize,
-    local_work_items: usize,
-    iterations_per_item: u32,
+    mut global_work_items: usize,
+    mut local_work_items: usize,
+    mut iterations_per_item: u32,
     total_guesses: Arc<AtomicU64>,
     stop: Arc<AtomicBool>,
 ) {
@@ -652,6 +658,23 @@ fn run_opencl_key_benchmark_worker(
                 base = base.wrapping_add(searched.wrapping_mul(stride));
             }
             Err(err) => {
+                if err.contains("failed: -5")
+                    && reduce_opencl_key_launch(
+                        &mut global_work_items,
+                        &mut local_work_items,
+                        &mut iterations_per_item,
+                    )
+                {
+                    eprintln!(
+                        "opencl_key_backoff platform={} device={} global_work_items={} local_work_items={} iterations_per_item={} reason={err}",
+                        device.platform_index,
+                        device.device_index,
+                        global_work_items,
+                        local_work_items,
+                        iterations_per_item
+                    );
+                    continue;
+                }
                 eprintln!(
                     "opencl_key_error platform={} device={} error={err}",
                     device.platform_index, device.device_index
@@ -660,6 +683,30 @@ fn run_opencl_key_benchmark_worker(
             }
         }
     }
+}
+
+fn reduce_opencl_key_launch(
+    global_work_items: &mut usize,
+    local_work_items: &mut usize,
+    iterations_per_item: &mut u32,
+) -> bool {
+    if *iterations_per_item > 1 {
+        *iterations_per_item = (*iterations_per_item / 2).max(1);
+    } else if *global_work_items > 1 {
+        *global_work_items = (*global_work_items / 2).max(1);
+    } else if *local_work_items > 1 {
+        *local_work_items = (*local_work_items / 2).max(1);
+    } else {
+        return false;
+    }
+
+    if *local_work_items > *global_work_items {
+        *local_work_items = *global_work_items;
+    }
+    if *global_work_items % *local_work_items != 0 {
+        *local_work_items = 1;
+    }
+    true
 }
 
 fn report_toy_hit(
@@ -1942,6 +1989,9 @@ fn parse_args() -> Result<Args, String> {
     let mut toy_opencl_global = DEFAULT_TOY_OPENCL_GLOBAL_WORK_ITEMS;
     let mut toy_opencl_local = DEFAULT_TOY_OPENCL_LOCAL_WORK_ITEMS;
     let mut toy_opencl_iters = DEFAULT_TOY_OPENCL_ITERS;
+    let mut key_opencl_global = DEFAULT_KEY_OPENCL_GLOBAL_WORK_ITEMS;
+    let mut key_opencl_local = DEFAULT_KEY_OPENCL_LOCAL_WORK_ITEMS;
+    let mut key_opencl_iters = DEFAULT_KEY_OPENCL_ITERS;
 
     let mut iter = env::args().skip(1);
     while let Some(arg) = iter.next() {
@@ -2040,6 +2090,30 @@ fn parse_args() -> Result<Args, String> {
                     return Err("--toy-opencl-iters must be greater than zero".to_owned());
                 }
             }
+            "--opencl-key-global" => {
+                key_opencl_global = next_arg(&mut iter, "--opencl-key-global")?
+                    .parse::<usize>()
+                    .map_err(|_| "--opencl-key-global must be a positive integer".to_owned())?;
+                if key_opencl_global == 0 {
+                    return Err("--opencl-key-global must be greater than zero".to_owned());
+                }
+            }
+            "--opencl-key-local" => {
+                key_opencl_local = next_arg(&mut iter, "--opencl-key-local")?
+                    .parse::<usize>()
+                    .map_err(|_| "--opencl-key-local must be a positive integer".to_owned())?;
+                if key_opencl_local == 0 {
+                    return Err("--opencl-key-local must be greater than zero".to_owned());
+                }
+            }
+            "--opencl-key-iters" => {
+                key_opencl_iters = next_arg(&mut iter, "--opencl-key-iters")?
+                    .parse::<u32>()
+                    .map_err(|_| "--opencl-key-iters must be a positive integer".to_owned())?;
+                if key_opencl_iters == 0 {
+                    return Err("--opencl-key-iters must be greater than zero".to_owned());
+                }
+            }
             other => return Err(format!("unknown argument: {other}")),
         }
     }
@@ -2051,6 +2125,14 @@ fn parse_args() -> Result<Args, String> {
     }
     if toy_opencl_global % toy_opencl_local != 0 {
         return Err("--toy-opencl-global must be a multiple of --toy-opencl-local".to_owned());
+    }
+    if key_opencl_local > key_opencl_global {
+        return Err(
+            "--opencl-key-local must be less than or equal to --opencl-key-global".to_owned(),
+        );
+    }
+    if key_opencl_global % key_opencl_local != 0 {
+        return Err("--opencl-key-global must be a multiple of --opencl-key-local".to_owned());
     }
 
     Ok(Args {
@@ -2070,6 +2152,9 @@ fn parse_args() -> Result<Args, String> {
         toy_opencl_global,
         toy_opencl_local,
         toy_opencl_iters,
+        key_opencl_global,
+        key_opencl_local,
+        key_opencl_iters,
     })
 }
 
@@ -2092,7 +2177,7 @@ fn synthetic_opencl_target_hash160_hex() -> String {
 
 fn print_usage_and_exit(code: i32) -> ! {
     eprintln!(
-        "Usage: satoshi-guesser [--threads N] [--stats-seconds N] [--targets wallets.csv] [--success-file path] [--compressed-only|--uncompressed-only] [--opencl-key-benchmark] [--toy-gpu-demo] [--toy-benchmark] [--toy-target-nonce N] [--toy-cuda-blocks N] [--toy-cuda-threads N] [--toy-cuda-iters N] [--toy-opencl-global N] [--toy-opencl-local N] [--toy-opencl-iters N]"
+        "Usage: satoshi-guesser [--threads N] [--stats-seconds N] [--targets wallets.csv] [--success-file path] [--compressed-only|--uncompressed-only] [--opencl-key-benchmark] [--opencl-key-global N] [--opencl-key-local N] [--opencl-key-iters N] [--toy-gpu-demo] [--toy-benchmark] [--toy-target-nonce N] [--toy-cuda-blocks N] [--toy-cuda-threads N] [--toy-cuda-iters N] [--toy-opencl-global N] [--toy-opencl-local N] [--toy-opencl-iters N]"
     );
     process::exit(code);
 }
