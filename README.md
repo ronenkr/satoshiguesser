@@ -86,6 +86,7 @@ Useful options:
 --compressed-only       only check compressed public-key addresses
 --uncompressed-only     only check uncompressed public-key addresses
 --toy-gpu-demo          run a synthetic u64 CUDA/OpenCL/CPU search demo instead
+--toy-benchmark         run the synthetic GPU demo without stopping on a hit
 ```
 
 For a dedicated server, pin the thread count to the number of cores you want to
@@ -137,13 +138,14 @@ Tesla P40 is compute capability 6.1, so the default CUDA architecture is
 CUDA_ARCH=sm_61 cargo build --release --features cuda-toy
 ```
 
-Run CPU workers plus all detected CUDA devices:
+Run CPU workers plus all detected CUDA devices as a benchmark. This prints
+`toy_stats` every 5 seconds and keeps running until you stop it:
 
 ```bash
-./target/release/satoshi-guesser --toy-gpu-demo --threads "$(nproc)"
+./target/release/satoshi-guesser --toy-benchmark --threads "$(nproc)"
 ```
 
-For a quick smoke test:
+For a quick smoke test that proves the find path works and exits:
 
 ```bash
 ./target/release/satoshi-guesser --toy-gpu-demo --threads 4 --toy-target-nonce 100000000
@@ -153,6 +155,7 @@ Toy CUDA tuning flags:
 
 ```text
 --toy-target-nonce N    synthetic nonce to find, default: 500000000
+--toy-benchmark         keep benchmarking and ignore synthetic hits
 --toy-cuda-blocks N     CUDA blocks per launch, default: 1024
 --toy-cuda-threads N    CUDA threads per block, default: 256
 --toy-cuda-iters N      loop iterations per CUDA thread, default: 256
@@ -193,10 +196,10 @@ Build with both CUDA and OpenCL toy support:
 cargo build --release --features "cuda-toy opencl-toy"
 ```
 
-Run CPU workers plus all detected CUDA and OpenCL GPU devices:
+Run CPU workers plus all detected CUDA and OpenCL GPU devices as a benchmark:
 
 ```bash
-./target/release/satoshi-guesser --toy-gpu-demo --threads "$(nproc)"
+./target/release/satoshi-guesser --toy-benchmark --threads "$(nproc)"
 ```
 
 Toy OpenCL tuning flags:

@@ -41,6 +41,7 @@ struct Args {
     compressed: bool,
     uncompressed: bool,
     toy_gpu_demo: bool,
+    toy_benchmark: bool,
     toy_target_nonce: u64,
     toy_cuda_blocks: u32,
     toy_cuda_threads: u32,
@@ -221,12 +222,14 @@ fn main() {
 
 fn run_toy_gpu_demo(args: Args) {
     let target_hash = toy_hash_u64(args.toy_target_nonce);
+    let report_hits = !args.toy_benchmark;
     let cuda_devices = toy_cuda_device_count();
     let opencl_devices = toy_opencl_devices();
     let total_lanes = args.threads + cuda_devices + opencl_devices.len();
 
     eprintln!(
-        "toy_gpu_demo target_nonce={} target_hash={:#018x}; cpu_threads={}; cuda_devices={}; opencl_devices={}; cpu_features={}",
+        "toy_gpu_demo mode={}; target_nonce={} target_hash={:#018x}; cpu_threads={}; cuda_devices={}; opencl_devices={}; cpu_features={}",
+        if args.toy_benchmark { "benchmark" } else { "find" },
         args.toy_target_nonce,
         target_hash,
         args.threads,
@@ -281,6 +284,7 @@ fn run_toy_gpu_demo(args: Args) {
                 worker_id as u64,
                 total_lanes as u64,
                 target_hash,
+                report_hits,
                 worker_total,
                 worker_stop,
                 worker_tx,
@@ -305,6 +309,7 @@ fn run_toy_gpu_demo(args: Args) {
                 blocks,
                 threads_per_block,
                 iterations_per_thread,
+                report_hits,
                 worker_total,
                 worker_stop,
                 worker_tx,
@@ -329,6 +334,7 @@ fn run_toy_gpu_demo(args: Args) {
                 global_work_items,
                 local_work_items,
                 iterations_per_item,
+                report_hits,
                 worker_total,
                 worker_stop,
                 worker_tx,
@@ -409,6 +415,7 @@ fn run_toy_cpu_worker(
     mut nonce: u64,
     stride: u64,
     target_hash: u64,
+    report_hits: bool,
     total_guesses: Arc<AtomicU64>,
     stop: Arc<AtomicBool>,
     hit_tx: mpsc::Sender<ToyHit>,
@@ -417,7 +424,7 @@ fn run_toy_cpu_worker(
     while !stop.load(AtomicOrdering::Relaxed) {
         local_count += 1;
         let hash = toy_hash_u64(nonce);
-        if hash == target_hash {
+        if report_hits && hash == target_hash {
             flush_count(&total_guesses, &mut local_count);
             report_toy_hit(&hit_tx, format!("cpu-{worker_id}"), nonce, hash, &stop);
             break;
@@ -439,6 +446,7 @@ fn run_toy_cuda_worker(
     blocks: u32,
     threads_per_block: u32,
     iterations_per_thread: u32,
+    report_hits: bool,
     total_guesses: Arc<AtomicU64>,
     stop: Arc<AtomicBool>,
     hit_tx: mpsc::Sender<ToyHit>,
@@ -455,8 +463,11 @@ fn run_toy_cuda_worker(
         ) {
             Ok((Some(nonce), searched)) => {
                 total_guesses.fetch_add(searched, AtomicOrdering::Relaxed);
-                report_toy_hit(&hit_tx, format!("cuda-{device}"), nonce, target_hash, &stop);
-                break;
+                if report_hits {
+                    report_toy_hit(&hit_tx, format!("cuda-{device}"), nonce, target_hash, &stop);
+                    break;
+                }
+                base = base.wrapping_add(searched.wrapping_mul(stride));
             }
             Ok((None, searched)) => {
                 total_guesses.fetch_add(searched, AtomicOrdering::Relaxed);
@@ -479,6 +490,7 @@ fn run_toy_opencl_worker(
     global_work_items: usize,
     local_work_items: usize,
     iterations_per_item: u32,
+    report_hits: bool,
     total_guesses: Arc<AtomicU64>,
     stop: Arc<AtomicBool>,
     hit_tx: mpsc::Sender<ToyHit>,
@@ -496,8 +508,11 @@ fn run_toy_opencl_worker(
         ) {
             Ok((Some(nonce), searched)) => {
                 total_guesses.fetch_add(searched, AtomicOrdering::Relaxed);
-                report_toy_hit(&hit_tx, source, nonce, target_hash, &stop);
-                break;
+                if report_hits {
+                    report_toy_hit(&hit_tx, source.clone(), nonce, target_hash, &stop);
+                    break;
+                }
+                base = base.wrapping_add(searched.wrapping_mul(stride));
             }
             Ok((None, searched)) => {
                 total_guesses.fetch_add(searched, AtomicOrdering::Relaxed);
@@ -1565,6 +1580,7 @@ fn parse_args() -> Result<Args, String> {
     let mut compressed = true;
     let mut uncompressed = true;
     let mut toy_gpu_demo = false;
+    let mut toy_benchmark = false;
     let mut toy_target_nonce = DEFAULT_TOY_TARGET_NONCE;
     let mut toy_cuda_blocks = DEFAULT_TOY_CUDA_BLOCKS;
     let mut toy_cuda_threads = DEFAULT_TOY_CUDA_THREADS;
@@ -1609,6 +1625,10 @@ fn parse_args() -> Result<Args, String> {
             }
             "--toy-gpu-demo" => {
                 toy_gpu_demo = true;
+            }
+            "--toy-benchmark" => {
+                toy_gpu_demo = true;
+                toy_benchmark = true;
             }
             "--toy-target-nonce" => {
                 toy_target_nonce = next_arg(&mut iter, "--toy-target-nonce")?
@@ -1684,6 +1704,7 @@ fn parse_args() -> Result<Args, String> {
         compressed,
         uncompressed,
         toy_gpu_demo,
+        toy_benchmark,
         toy_target_nonce,
         toy_cuda_blocks,
         toy_cuda_threads,
@@ -1701,7 +1722,7 @@ fn next_arg(iter: &mut impl Iterator<Item = String>, flag: &str) -> Result<Strin
 
 fn print_usage_and_exit(code: i32) -> ! {
     eprintln!(
-        "Usage: satoshi-guesser [--threads N] [--stats-seconds N] [--targets wallets.csv] [--success-file path] [--compressed-only|--uncompressed-only] [--toy-gpu-demo] [--toy-target-nonce N] [--toy-cuda-blocks N] [--toy-cuda-threads N] [--toy-cuda-iters N] [--toy-opencl-global N] [--toy-opencl-local N] [--toy-opencl-iters N]"
+        "Usage: satoshi-guesser [--threads N] [--stats-seconds N] [--targets wallets.csv] [--success-file path] [--compressed-only|--uncompressed-only] [--toy-gpu-demo] [--toy-benchmark] [--toy-target-nonce N] [--toy-cuda-blocks N] [--toy-cuda-threads N] [--toy-cuda-iters N] [--toy-opencl-global N] [--toy-opencl-local N] [--toy-opencl-iters N]"
     );
     process::exit(code);
 }
