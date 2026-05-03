@@ -13,6 +13,13 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
+#[cfg(feature = "opencl-toy")]
+use std::{
+    ffi::CString,
+    os::raw::{c_char, c_int, c_uint, c_void},
+    ptr,
+};
+
 const EMBEDDED_WALLETS: &str = include_str!("../data/wallets.csv");
 const DEFAULT_STATS_SECONDS: u64 = 5;
 const DEFAULT_SUCCESS_FILE: &str = "satoshi-guesser-success.txt";
@@ -20,6 +27,9 @@ const DEFAULT_TOY_TARGET_NONCE: u64 = 500_000_000;
 const DEFAULT_TOY_CUDA_BLOCKS: u32 = 1024;
 const DEFAULT_TOY_CUDA_THREADS: u32 = 256;
 const DEFAULT_TOY_CUDA_ITERS: u32 = 256;
+const DEFAULT_TOY_OPENCL_GLOBAL_WORK_ITEMS: usize = 262_144;
+const DEFAULT_TOY_OPENCL_LOCAL_WORK_ITEMS: usize = 256;
+const DEFAULT_TOY_OPENCL_ITERS: u32 = 256;
 const SATS_PER_BTC: u64 = 100_000_000;
 
 #[derive(Clone, Debug)]
@@ -35,6 +45,9 @@ struct Args {
     toy_cuda_blocks: u32,
     toy_cuda_threads: u32,
     toy_cuda_iters: u32,
+    toy_opencl_global: usize,
+    toy_opencl_local: usize,
+    toy_opencl_iters: u32,
 }
 
 #[derive(Clone, Debug)]
@@ -75,6 +88,13 @@ struct ToyHit {
     source: String,
     nonce: u64,
     hash: u64,
+}
+
+#[derive(Clone, Debug)]
+struct ToyOpenClDevice {
+    platform_index: usize,
+    device_index: usize,
+    name: String,
 }
 
 fn main() {
@@ -202,14 +222,16 @@ fn main() {
 fn run_toy_gpu_demo(args: Args) {
     let target_hash = toy_hash_u64(args.toy_target_nonce);
     let cuda_devices = toy_cuda_device_count();
-    let total_lanes = args.threads + cuda_devices;
+    let opencl_devices = toy_opencl_devices();
+    let total_lanes = args.threads + cuda_devices + opencl_devices.len();
 
     eprintln!(
-        "toy_gpu_demo target_nonce={} target_hash={:#018x}; cpu_threads={}; cuda_devices={}; cpu_features={}",
+        "toy_gpu_demo target_nonce={} target_hash={:#018x}; cpu_threads={}; cuda_devices={}; opencl_devices={}; cpu_features={}",
         args.toy_target_nonce,
         target_hash,
         args.threads,
         cuda_devices,
+        opencl_devices.len(),
         cpu_feature_summary()
     );
 
@@ -227,6 +249,21 @@ fn run_toy_gpu_demo(args: Args) {
         );
     } else {
         eprintln!("toy_cuda_status=no_cuda_devices_found");
+    }
+
+    if !opencl_devices.is_empty() {
+        for device in &opencl_devices {
+            eprintln!(
+                "toy_opencl_device platform={} device={} name={}",
+                device.platform_index, device.device_index, device.name
+            );
+        }
+    } else if !toy_opencl_compiled() {
+        eprintln!(
+            "toy_opencl_status=not_compiled build with: cargo build --release --features opencl-toy"
+        );
+    } else {
+        eprintln!("toy_opencl_status=no_opencl_gpu_devices_found");
     }
 
     let total_guesses = Arc::new(AtomicU64::new(0));
@@ -268,6 +305,30 @@ fn run_toy_gpu_demo(args: Args) {
                 blocks,
                 threads_per_block,
                 iterations_per_thread,
+                worker_total,
+                worker_stop,
+                worker_tx,
+            );
+        }));
+    }
+
+    for (opencl_index, device) in opencl_devices.into_iter().enumerate() {
+        let worker_total = Arc::clone(&total_guesses);
+        let worker_stop = Arc::clone(&stop);
+        let worker_tx = hit_tx.clone();
+        let lane = args.threads + cuda_devices + opencl_index;
+        let global_work_items = args.toy_opencl_global;
+        let local_work_items = args.toy_opencl_local;
+        let iterations_per_item = args.toy_opencl_iters;
+        workers.push(thread::spawn(move || {
+            run_toy_opencl_worker(
+                device,
+                lane as u64,
+                total_lanes as u64,
+                target_hash,
+                global_work_items,
+                local_work_items,
+                iterations_per_item,
                 worker_total,
                 worker_stop,
                 worker_tx,
@@ -403,6 +464,50 @@ fn run_toy_cuda_worker(
             }
             Err(err) => {
                 eprintln!("toy_cuda_error device={device} error={err}");
+                break;
+            }
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_toy_opencl_worker(
+    device: ToyOpenClDevice,
+    mut base: u64,
+    stride: u64,
+    target_hash: u64,
+    global_work_items: usize,
+    local_work_items: usize,
+    iterations_per_item: u32,
+    total_guesses: Arc<AtomicU64>,
+    stop: Arc<AtomicBool>,
+    hit_tx: mpsc::Sender<ToyHit>,
+) {
+    let source = format!("opencl-{}-{}", device.platform_index, device.device_index);
+    while !stop.load(AtomicOrdering::Relaxed) {
+        match toy_opencl_search_device(
+            &device,
+            base,
+            stride,
+            target_hash,
+            global_work_items,
+            local_work_items,
+            iterations_per_item,
+        ) {
+            Ok((Some(nonce), searched)) => {
+                total_guesses.fetch_add(searched, AtomicOrdering::Relaxed);
+                report_toy_hit(&hit_tx, source, nonce, target_hash, &stop);
+                break;
+            }
+            Ok((None, searched)) => {
+                total_guesses.fetch_add(searched, AtomicOrdering::Relaxed);
+                base = base.wrapping_add(searched.wrapping_mul(stride));
+            }
+            Err(err) => {
+                eprintln!(
+                    "toy_opencl_error platform={} device={} error={err}",
+                    device.platform_index, device.device_index
+                );
                 break;
             }
         }
@@ -640,6 +745,611 @@ fn toy_cuda_search_device(
     Err(-999)
 }
 
+#[cfg(feature = "opencl-toy")]
+type ClPlatformId = *mut c_void;
+#[cfg(feature = "opencl-toy")]
+type ClDeviceId = *mut c_void;
+#[cfg(feature = "opencl-toy")]
+type ClContext = *mut c_void;
+#[cfg(feature = "opencl-toy")]
+type ClCommandQueue = *mut c_void;
+#[cfg(feature = "opencl-toy")]
+type ClProgram = *mut c_void;
+#[cfg(feature = "opencl-toy")]
+type ClKernel = *mut c_void;
+#[cfg(feature = "opencl-toy")]
+type ClMem = *mut c_void;
+
+#[cfg(feature = "opencl-toy")]
+const CL_SUCCESS: c_int = 0;
+#[cfg(feature = "opencl-toy")]
+const CL_DEVICE_TYPE_GPU: u64 = 1 << 2;
+#[cfg(feature = "opencl-toy")]
+const CL_DEVICE_NAME: c_uint = 0x102b;
+#[cfg(feature = "opencl-toy")]
+const CL_PROGRAM_BUILD_LOG: c_uint = 0x1183;
+#[cfg(feature = "opencl-toy")]
+const CL_MEM_READ_WRITE: u64 = 1;
+#[cfg(feature = "opencl-toy")]
+const CL_TRUE: c_uint = 1;
+
+#[cfg(feature = "opencl-toy")]
+const OPENCL_TOY_KERNEL: &str = r#"
+static ulong toy_hash_ulong(ulong x) {
+    x += 0x9e3779b97f4a7c15UL;
+    x = (x ^ (x >> 30)) * 0xbf58476d1ce4e5b9UL;
+    x = (x ^ (x >> 27)) * 0x94d049bb133111ebUL;
+    return x ^ (x >> 31);
+}
+
+__kernel void toy_search(
+    ulong base,
+    ulong stride,
+    ulong target_hash,
+    uint iterations_per_item,
+    __global ulong* found_nonce,
+    __global uint* found_flag
+) {
+    ulong gid = (ulong)get_global_id(0);
+    ulong global = (ulong)get_global_size(0);
+
+    for (uint i = 0; i < iterations_per_item; i++) {
+        if (*found_flag != 0u) {
+            return;
+        }
+
+        ulong nonce = base + (gid + ((ulong)i * global)) * stride;
+        if (toy_hash_ulong(nonce) == target_hash) {
+            if (atomic_cmpxchg((volatile __global unsigned int*)found_flag, 0u, 1u) == 0u) {
+                *found_nonce = nonce;
+            }
+            return;
+        }
+    }
+}
+"#;
+
+#[cfg(feature = "opencl-toy")]
+#[cfg_attr(target_os = "macos", link(name = "OpenCL", kind = "framework"))]
+#[cfg_attr(not(target_os = "macos"), link(name = "OpenCL"))]
+extern "C" {
+    fn clGetPlatformIDs(
+        num_entries: c_uint,
+        platforms: *mut ClPlatformId,
+        num_platforms: *mut c_uint,
+    ) -> c_int;
+    fn clGetDeviceIDs(
+        platform: ClPlatformId,
+        device_type: u64,
+        num_entries: c_uint,
+        devices: *mut ClDeviceId,
+        num_devices: *mut c_uint,
+    ) -> c_int;
+    fn clGetDeviceInfo(
+        device: ClDeviceId,
+        param_name: c_uint,
+        param_value_size: usize,
+        param_value: *mut c_void,
+        param_value_size_ret: *mut usize,
+    ) -> c_int;
+    fn clCreateContext(
+        properties: *const isize,
+        num_devices: c_uint,
+        devices: *const ClDeviceId,
+        pfn_notify: Option<unsafe extern "C" fn(*const c_char, *const c_void, usize, *mut c_void)>,
+        user_data: *mut c_void,
+        errcode_ret: *mut c_int,
+    ) -> ClContext;
+    fn clCreateCommandQueue(
+        context: ClContext,
+        device: ClDeviceId,
+        properties: u64,
+        errcode_ret: *mut c_int,
+    ) -> ClCommandQueue;
+    fn clCreateProgramWithSource(
+        context: ClContext,
+        count: c_uint,
+        strings: *const *const c_char,
+        lengths: *const usize,
+        errcode_ret: *mut c_int,
+    ) -> ClProgram;
+    fn clBuildProgram(
+        program: ClProgram,
+        num_devices: c_uint,
+        device_list: *const ClDeviceId,
+        options: *const c_char,
+        pfn_notify: Option<unsafe extern "C" fn(ClProgram, *mut c_void)>,
+        user_data: *mut c_void,
+    ) -> c_int;
+    fn clGetProgramBuildInfo(
+        program: ClProgram,
+        device: ClDeviceId,
+        param_name: c_uint,
+        param_value_size: usize,
+        param_value: *mut c_void,
+        param_value_size_ret: *mut usize,
+    ) -> c_int;
+    fn clCreateKernel(
+        program: ClProgram,
+        kernel_name: *const c_char,
+        errcode_ret: *mut c_int,
+    ) -> ClKernel;
+    fn clCreateBuffer(
+        context: ClContext,
+        flags: u64,
+        size: usize,
+        host_ptr: *mut c_void,
+        errcode_ret: *mut c_int,
+    ) -> ClMem;
+    fn clEnqueueWriteBuffer(
+        command_queue: ClCommandQueue,
+        buffer: ClMem,
+        blocking_write: c_uint,
+        offset: usize,
+        size: usize,
+        ptr: *const c_void,
+        num_events_in_wait_list: c_uint,
+        event_wait_list: *const c_void,
+        event: *mut c_void,
+    ) -> c_int;
+    fn clSetKernelArg(
+        kernel: ClKernel,
+        arg_index: c_uint,
+        arg_size: usize,
+        arg_value: *const c_void,
+    ) -> c_int;
+    fn clEnqueueNDRangeKernel(
+        command_queue: ClCommandQueue,
+        kernel: ClKernel,
+        work_dim: c_uint,
+        global_work_offset: *const usize,
+        global_work_size: *const usize,
+        local_work_size: *const usize,
+        num_events_in_wait_list: c_uint,
+        event_wait_list: *const c_void,
+        event: *mut c_void,
+    ) -> c_int;
+    fn clFinish(command_queue: ClCommandQueue) -> c_int;
+    fn clEnqueueReadBuffer(
+        command_queue: ClCommandQueue,
+        buffer: ClMem,
+        blocking_read: c_uint,
+        offset: usize,
+        size: usize,
+        ptr: *mut c_void,
+        num_events_in_wait_list: c_uint,
+        event_wait_list: *const c_void,
+        event: *mut c_void,
+    ) -> c_int;
+    fn clReleaseMemObject(memobj: ClMem) -> c_int;
+    fn clReleaseKernel(kernel: ClKernel) -> c_int;
+    fn clReleaseProgram(program: ClProgram) -> c_int;
+    fn clReleaseCommandQueue(command_queue: ClCommandQueue) -> c_int;
+    fn clReleaseContext(context: ClContext) -> c_int;
+}
+
+#[cfg(feature = "opencl-toy")]
+fn toy_opencl_compiled() -> bool {
+    true
+}
+
+#[cfg(not(feature = "opencl-toy"))]
+fn toy_opencl_compiled() -> bool {
+    false
+}
+
+#[cfg(feature = "opencl-toy")]
+fn toy_opencl_devices() -> Vec<ToyOpenClDevice> {
+    let mut devices = Vec::new();
+    let platforms = match opencl_platforms() {
+        Ok(platforms) => platforms,
+        Err(err) => {
+            eprintln!("toy_opencl_platform_error={err}");
+            return devices;
+        }
+    };
+
+    for (platform_index, platform) in platforms.into_iter().enumerate() {
+        let platform_devices = match opencl_gpu_devices(platform) {
+            Ok(platform_devices) => platform_devices,
+            Err(_) => continue,
+        };
+        for (device_index, device) in platform_devices.into_iter().enumerate() {
+            devices.push(ToyOpenClDevice {
+                platform_index,
+                device_index,
+                name: opencl_device_name(device),
+            });
+        }
+    }
+
+    devices
+}
+
+#[cfg(not(feature = "opencl-toy"))]
+fn toy_opencl_devices() -> Vec<ToyOpenClDevice> {
+    Vec::new()
+}
+
+#[cfg(feature = "opencl-toy")]
+fn toy_opencl_search_device(
+    device: &ToyOpenClDevice,
+    base: u64,
+    stride: u64,
+    target_hash: u64,
+    global_work_items: usize,
+    local_work_items: usize,
+    iterations_per_item: u32,
+) -> Result<(Option<u64>, u64), String> {
+    let device_id = opencl_device_by_index(device.platform_index, device.device_index)?;
+    let source = CString::new(OPENCL_TOY_KERNEL).expect("OpenCL source has no interior NUL");
+    let kernel_name = CString::new("toy_search").expect("kernel name has no interior NUL");
+
+    let mut status = CL_SUCCESS;
+    let context = unsafe {
+        clCreateContext(
+            ptr::null(),
+            1,
+            &device_id,
+            None,
+            ptr::null_mut(),
+            &mut status,
+        )
+    };
+    if status != CL_SUCCESS || context.is_null() {
+        return Err(format!("clCreateContext failed: {status}"));
+    }
+
+    let queue = unsafe { clCreateCommandQueue(context, device_id, 0, &mut status) };
+    if status != CL_SUCCESS || queue.is_null() {
+        unsafe {
+            clReleaseContext(context);
+        }
+        return Err(format!("clCreateCommandQueue failed: {status}"));
+    }
+
+    let source_ptr = source.as_ptr();
+    let source_len = OPENCL_TOY_KERNEL.len();
+    let program =
+        unsafe { clCreateProgramWithSource(context, 1, &source_ptr, &source_len, &mut status) };
+    if status != CL_SUCCESS || program.is_null() {
+        unsafe {
+            clReleaseCommandQueue(queue);
+            clReleaseContext(context);
+        }
+        return Err(format!("clCreateProgramWithSource failed: {status}"));
+    }
+
+    let build_status =
+        unsafe { clBuildProgram(program, 1, &device_id, ptr::null(), None, ptr::null_mut()) };
+    if build_status != CL_SUCCESS {
+        let log = opencl_build_log(program, device_id);
+        unsafe {
+            clReleaseProgram(program);
+            clReleaseCommandQueue(queue);
+            clReleaseContext(context);
+        }
+        return Err(format!("clBuildProgram failed: {build_status}: {log}"));
+    }
+
+    let kernel = unsafe { clCreateKernel(program, kernel_name.as_ptr(), &mut status) };
+    if status != CL_SUCCESS || kernel.is_null() {
+        unsafe {
+            clReleaseProgram(program);
+            clReleaseCommandQueue(queue);
+            clReleaseContext(context);
+        }
+        return Err(format!("clCreateKernel failed: {status}"));
+    }
+
+    let found_nonce_buf = unsafe {
+        clCreateBuffer(
+            context,
+            CL_MEM_READ_WRITE,
+            std::mem::size_of::<u64>(),
+            ptr::null_mut(),
+            &mut status,
+        )
+    };
+    if status != CL_SUCCESS || found_nonce_buf.is_null() {
+        unsafe {
+            clReleaseKernel(kernel);
+            clReleaseProgram(program);
+            clReleaseCommandQueue(queue);
+            clReleaseContext(context);
+        }
+        return Err(format!("clCreateBuffer(found_nonce) failed: {status}"));
+    }
+
+    let found_flag_buf = unsafe {
+        clCreateBuffer(
+            context,
+            CL_MEM_READ_WRITE,
+            std::mem::size_of::<c_uint>(),
+            ptr::null_mut(),
+            &mut status,
+        )
+    };
+    if status != CL_SUCCESS || found_flag_buf.is_null() {
+        unsafe {
+            clReleaseMemObject(found_nonce_buf);
+            clReleaseKernel(kernel);
+            clReleaseProgram(program);
+            clReleaseCommandQueue(queue);
+            clReleaseContext(context);
+        }
+        return Err(format!("clCreateBuffer(found_flag) failed: {status}"));
+    }
+
+    let zero_nonce = 0_u64;
+    let zero_flag = 0_u32;
+    let mut found_nonce = 0_u64;
+    let mut found_flag = 0_u32;
+    let search_result = unsafe {
+        check_opencl(
+            clEnqueueWriteBuffer(
+                queue,
+                found_nonce_buf,
+                CL_TRUE,
+                0,
+                std::mem::size_of::<u64>(),
+                &zero_nonce as *const u64 as *const c_void,
+                0,
+                ptr::null(),
+                ptr::null_mut(),
+            ),
+            "clEnqueueWriteBuffer(found_nonce)",
+        )?;
+        check_opencl(
+            clEnqueueWriteBuffer(
+                queue,
+                found_flag_buf,
+                CL_TRUE,
+                0,
+                std::mem::size_of::<c_uint>(),
+                &zero_flag as *const u32 as *const c_void,
+                0,
+                ptr::null(),
+                ptr::null_mut(),
+            ),
+            "clEnqueueWriteBuffer(found_flag)",
+        )?;
+
+        set_opencl_arg(kernel, 0, &base)?;
+        set_opencl_arg(kernel, 1, &stride)?;
+        set_opencl_arg(kernel, 2, &target_hash)?;
+        set_opencl_arg(kernel, 3, &iterations_per_item)?;
+        set_opencl_arg(kernel, 4, &found_nonce_buf)?;
+        set_opencl_arg(kernel, 5, &found_flag_buf)?;
+
+        let global = [global_work_items];
+        let local = [local_work_items];
+        check_opencl(
+            clEnqueueNDRangeKernel(
+                queue,
+                kernel,
+                1,
+                ptr::null(),
+                global.as_ptr(),
+                local.as_ptr(),
+                0,
+                ptr::null(),
+                ptr::null_mut(),
+            ),
+            "clEnqueueNDRangeKernel",
+        )?;
+        check_opencl(clFinish(queue), "clFinish")?;
+
+        check_opencl(
+            clEnqueueReadBuffer(
+                queue,
+                found_nonce_buf,
+                CL_TRUE,
+                0,
+                std::mem::size_of::<u64>(),
+                &mut found_nonce as *mut u64 as *mut c_void,
+                0,
+                ptr::null(),
+                ptr::null_mut(),
+            ),
+            "clEnqueueReadBuffer(found_nonce)",
+        )?;
+        check_opencl(
+            clEnqueueReadBuffer(
+                queue,
+                found_flag_buf,
+                CL_TRUE,
+                0,
+                std::mem::size_of::<c_uint>(),
+                &mut found_flag as *mut u32 as *mut c_void,
+                0,
+                ptr::null(),
+                ptr::null_mut(),
+            ),
+            "clEnqueueReadBuffer(found_flag)",
+        )
+    };
+
+    unsafe {
+        clReleaseMemObject(found_flag_buf);
+        clReleaseMemObject(found_nonce_buf);
+        clReleaseKernel(kernel);
+        clReleaseProgram(program);
+        clReleaseCommandQueue(queue);
+        clReleaseContext(context);
+    }
+    search_result?;
+
+    let searched = (global_work_items as u64).saturating_mul(iterations_per_item as u64);
+    if found_flag != 0 {
+        Ok((Some(found_nonce), searched))
+    } else {
+        Ok((None, searched))
+    }
+}
+
+#[cfg(not(feature = "opencl-toy"))]
+fn toy_opencl_search_device(
+    _device: &ToyOpenClDevice,
+    _base: u64,
+    _stride: u64,
+    _target_hash: u64,
+    _global_work_items: usize,
+    _local_work_items: usize,
+    _iterations_per_item: u32,
+) -> Result<(Option<u64>, u64), String> {
+    Err("opencl-toy feature is not compiled".to_owned())
+}
+
+#[cfg(feature = "opencl-toy")]
+fn opencl_platforms() -> Result<Vec<ClPlatformId>, String> {
+    let mut count: c_uint = 0;
+    let rc = unsafe { clGetPlatformIDs(0, ptr::null_mut(), &mut count) };
+    if rc != CL_SUCCESS {
+        return Err(format!("clGetPlatformIDs(count) failed: {rc}"));
+    }
+    if count == 0 {
+        return Ok(Vec::new());
+    }
+
+    let mut platforms = vec![ptr::null_mut(); count as usize];
+    let rc = unsafe { clGetPlatformIDs(count, platforms.as_mut_ptr(), ptr::null_mut()) };
+    if rc != CL_SUCCESS {
+        return Err(format!("clGetPlatformIDs(list) failed: {rc}"));
+    }
+    Ok(platforms)
+}
+
+#[cfg(feature = "opencl-toy")]
+fn opencl_gpu_devices(platform: ClPlatformId) -> Result<Vec<ClDeviceId>, String> {
+    let mut count: c_uint = 0;
+    let rc =
+        unsafe { clGetDeviceIDs(platform, CL_DEVICE_TYPE_GPU, 0, ptr::null_mut(), &mut count) };
+    if rc != CL_SUCCESS || count == 0 {
+        return Ok(Vec::new());
+    }
+
+    let mut devices = vec![ptr::null_mut(); count as usize];
+    let rc = unsafe {
+        clGetDeviceIDs(
+            platform,
+            CL_DEVICE_TYPE_GPU,
+            count,
+            devices.as_mut_ptr(),
+            ptr::null_mut(),
+        )
+    };
+    if rc != CL_SUCCESS {
+        return Err(format!("clGetDeviceIDs(list) failed: {rc}"));
+    }
+    Ok(devices)
+}
+
+#[cfg(feature = "opencl-toy")]
+fn opencl_device_by_index(
+    platform_index: usize,
+    device_index: usize,
+) -> Result<ClDeviceId, String> {
+    let platforms = opencl_platforms()?;
+    let platform = platforms
+        .get(platform_index)
+        .copied()
+        .ok_or_else(|| format!("OpenCL platform index {platform_index} no longer exists"))?;
+    let devices = opencl_gpu_devices(platform)?;
+    devices
+        .get(device_index)
+        .copied()
+        .ok_or_else(|| format!("OpenCL device index {device_index} no longer exists"))
+}
+
+#[cfg(feature = "opencl-toy")]
+fn opencl_device_name(device: ClDeviceId) -> String {
+    let mut size = 0_usize;
+    let rc = unsafe { clGetDeviceInfo(device, CL_DEVICE_NAME, 0, ptr::null_mut(), &mut size) };
+    if rc != CL_SUCCESS || size == 0 {
+        return format!("unknown({rc})");
+    }
+
+    let mut buf = vec![0_u8; size];
+    let rc = unsafe {
+        clGetDeviceInfo(
+            device,
+            CL_DEVICE_NAME,
+            buf.len(),
+            buf.as_mut_ptr() as *mut c_void,
+            ptr::null_mut(),
+        )
+    };
+    if rc != CL_SUCCESS {
+        return format!("unknown({rc})");
+    }
+
+    if let Some(nul) = buf.iter().position(|&byte| byte == 0) {
+        buf.truncate(nul);
+    }
+    String::from_utf8_lossy(&buf).into_owned()
+}
+
+#[cfg(feature = "opencl-toy")]
+fn opencl_build_log(program: ClProgram, device: ClDeviceId) -> String {
+    let mut size = 0_usize;
+    let rc = unsafe {
+        clGetProgramBuildInfo(
+            program,
+            device,
+            CL_PROGRAM_BUILD_LOG,
+            0,
+            ptr::null_mut(),
+            &mut size,
+        )
+    };
+    if rc != CL_SUCCESS || size == 0 {
+        return format!("no build log ({rc})");
+    }
+
+    let mut buf = vec![0_u8; size];
+    let rc = unsafe {
+        clGetProgramBuildInfo(
+            program,
+            device,
+            CL_PROGRAM_BUILD_LOG,
+            buf.len(),
+            buf.as_mut_ptr() as *mut c_void,
+            ptr::null_mut(),
+        )
+    };
+    if rc != CL_SUCCESS {
+        return format!("failed to read build log ({rc})");
+    }
+
+    if let Some(nul) = buf.iter().position(|&byte| byte == 0) {
+        buf.truncate(nul);
+    }
+    String::from_utf8_lossy(&buf).into_owned()
+}
+
+#[cfg(feature = "opencl-toy")]
+unsafe fn set_opencl_arg<T>(kernel: ClKernel, index: c_uint, value: &T) -> Result<(), String> {
+    check_opencl(
+        clSetKernelArg(
+            kernel,
+            index,
+            std::mem::size_of::<T>(),
+            value as *const T as *const c_void,
+        ),
+        "clSetKernelArg",
+    )
+}
+
+#[cfg(feature = "opencl-toy")]
+fn check_opencl(rc: c_int, name: &str) -> Result<(), String> {
+    if rc == CL_SUCCESS {
+        Ok(())
+    } else {
+        Err(format!("{name} failed: {rc}"))
+    }
+}
+
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 fn cpu_feature_summary() -> String {
     let mut features = Vec::new();
@@ -864,6 +1574,9 @@ fn parse_args() -> Result<Args, String> {
     let mut toy_cuda_blocks = DEFAULT_TOY_CUDA_BLOCKS;
     let mut toy_cuda_threads = DEFAULT_TOY_CUDA_THREADS;
     let mut toy_cuda_iters = DEFAULT_TOY_CUDA_ITERS;
+    let mut toy_opencl_global = DEFAULT_TOY_OPENCL_GLOBAL_WORK_ITEMS;
+    let mut toy_opencl_local = DEFAULT_TOY_OPENCL_LOCAL_WORK_ITEMS;
+    let mut toy_opencl_iters = DEFAULT_TOY_OPENCL_ITERS;
 
     let mut iter = env::args().skip(1);
     while let Some(arg) = iter.next() {
@@ -931,8 +1644,41 @@ fn parse_args() -> Result<Args, String> {
                     return Err("--toy-cuda-iters must be greater than zero".to_owned());
                 }
             }
+            "--toy-opencl-global" => {
+                toy_opencl_global = next_arg(&mut iter, "--toy-opencl-global")?
+                    .parse::<usize>()
+                    .map_err(|_| "--toy-opencl-global must be a positive integer".to_owned())?;
+                if toy_opencl_global == 0 {
+                    return Err("--toy-opencl-global must be greater than zero".to_owned());
+                }
+            }
+            "--toy-opencl-local" => {
+                toy_opencl_local = next_arg(&mut iter, "--toy-opencl-local")?
+                    .parse::<usize>()
+                    .map_err(|_| "--toy-opencl-local must be a positive integer".to_owned())?;
+                if toy_opencl_local == 0 {
+                    return Err("--toy-opencl-local must be greater than zero".to_owned());
+                }
+            }
+            "--toy-opencl-iters" => {
+                toy_opencl_iters = next_arg(&mut iter, "--toy-opencl-iters")?
+                    .parse::<u32>()
+                    .map_err(|_| "--toy-opencl-iters must be a positive integer".to_owned())?;
+                if toy_opencl_iters == 0 {
+                    return Err("--toy-opencl-iters must be greater than zero".to_owned());
+                }
+            }
             other => return Err(format!("unknown argument: {other}")),
         }
+    }
+
+    if toy_opencl_local > toy_opencl_global {
+        return Err(
+            "--toy-opencl-local must be less than or equal to --toy-opencl-global".to_owned(),
+        );
+    }
+    if toy_opencl_global % toy_opencl_local != 0 {
+        return Err("--toy-opencl-global must be a multiple of --toy-opencl-local".to_owned());
     }
 
     Ok(Args {
@@ -947,6 +1693,9 @@ fn parse_args() -> Result<Args, String> {
         toy_cuda_blocks,
         toy_cuda_threads,
         toy_cuda_iters,
+        toy_opencl_global,
+        toy_opencl_local,
+        toy_opencl_iters,
     })
 }
 
@@ -957,7 +1706,7 @@ fn next_arg(iter: &mut impl Iterator<Item = String>, flag: &str) -> Result<Strin
 
 fn print_usage_and_exit(code: i32) -> ! {
     eprintln!(
-        "Usage: satoshi-guesser [--threads N] [--stats-seconds N] [--targets wallets.csv] [--success-file path] [--compressed-only|--uncompressed-only] [--toy-gpu-demo] [--toy-target-nonce N] [--toy-cuda-blocks N] [--toy-cuda-threads N] [--toy-cuda-iters N]"
+        "Usage: satoshi-guesser [--threads N] [--stats-seconds N] [--targets wallets.csv] [--success-file path] [--compressed-only|--uncompressed-only] [--toy-gpu-demo] [--toy-target-nonce N] [--toy-cuda-blocks N] [--toy-cuda-threads N] [--toy-cuda-iters N] [--toy-opencl-global N] [--toy-opencl-local N] [--toy-opencl-iters N]"
     );
     process::exit(code);
 }

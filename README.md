@@ -85,7 +85,7 @@ Useful options:
 --success-file path     where to write a hit, default: satoshi-guesser-success.txt
 --compressed-only       only check compressed public-key addresses
 --uncompressed-only     only check uncompressed public-key addresses
---toy-gpu-demo          run a synthetic u64 CUDA/CPU search demo instead
+--toy-gpu-demo          run a synthetic u64 CUDA/OpenCL/CPU search demo instead
 ```
 
 For a dedicated server, pin the thread count to the number of cores you want to
@@ -115,12 +115,14 @@ and WIF, matched address, balance, address form, and total guess count, then
 writes the same result to `satoshi-guesser-success.txt` unless `--success-file`
 points somewhere else.
 
-## Synthetic CUDA Demo
+## Synthetic GPU Demo
 
-The real Bitcoin-address search path is CPU-only. For testing your Tesla P40s,
+The real Bitcoin-address search path is CPU-only. For testing GPU scheduling,
 there is a separate synthetic demo that searches an internally generated `u64`
 nonce space. It does not use `data/wallets.csv`, Bitcoin addresses, secp256k1,
 or private keys.
+
+### CUDA
 
 On Ubuntu with the NVIDIA driver and CUDA toolkit installed:
 
@@ -161,6 +163,53 @@ runs on CPU and prints a message explaining how to enable CUDA.
 
 CUDA is NVIDIA-only and is not available on Apple Silicon. The synthetic toy
 mode still runs on Apple CPUs and benefits from native ARM code generation.
+
+### OpenCL
+
+The OpenCL toy backend is for general GPU compute devices such as Intel iGPUs.
+It is not Intel Quick Sync; Quick Sync is a video encode/decode block and is not
+useful for this kind of synthetic search. On Ubuntu, install an OpenCL ICD and
+headers. Package names vary by Ubuntu and Intel GPU generation, but common
+starting points are:
+
+```bash
+sudo apt install ocl-icd-opencl-dev clinfo intel-opencl-icd
+clinfo
+```
+
+HD 610-class iGPUs usually use Intel's modern OpenCL runtime. Older Broadwell
+parts such as HD 5300 may need an older or distro-specific Intel OpenCL package.
+`clinfo` should list the GPU before the Rust binary can use it.
+
+Build with OpenCL toy support:
+
+```bash
+cargo build --release --features opencl-toy
+```
+
+Build with both CUDA and OpenCL toy support:
+
+```bash
+cargo build --release --features "cuda-toy opencl-toy"
+```
+
+Run CPU workers plus all detected CUDA and OpenCL GPU devices:
+
+```bash
+./target/release/satoshi-guesser --toy-gpu-demo --threads "$(nproc)"
+```
+
+Toy OpenCL tuning flags:
+
+```text
+--toy-opencl-global N   OpenCL global work-items per launch, default: 262144
+--toy-opencl-local N    OpenCL local work-items per group, default: 256
+--toy-opencl-iters N    loop iterations per OpenCL work-item, default: 256
+```
+
+The global work-item count must be a multiple of the local work-item count. If
+the binary was not compiled with `--features opencl-toy`, toy mode still runs on
+CPU/CUDA and prints a message explaining how to enable OpenCL.
 
 ## Data
 

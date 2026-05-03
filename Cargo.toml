@@ -8,6 +8,7 @@ build = "build.rs"
 [features]
 default = []
 cuda-toy = []
+opencl-toy = []
 
 [dependencies]
 bs58 = { version = "0.5", features = ["check"] }
