@@ -85,6 +85,7 @@ Useful options:
 --success-file path     where to write a hit, default: satoshi-guesser-success.txt
 --compressed-only       only check compressed public-key addresses
 --uncompressed-only     only check uncompressed public-key addresses
+--opencl-key-benchmark  benchmark full OpenCL key->HASH160 work
 --toy-gpu-demo          run a synthetic u64 CUDA/OpenCL/CPU search demo instead
 --toy-benchmark         run the synthetic GPU demo without stopping on a hit
 ```
@@ -202,6 +203,11 @@ Run CPU workers plus all detected CUDA and OpenCL GPU devices as a benchmark:
 ./target/release/satoshi-guesser --toy-benchmark --threads "$(nproc)"
 ```
 
+In OpenCL benchmark mode, the kernel does not run the find-and-exit path. Every
+work item executes the full configured loop and writes a checksum value back to
+device memory before the host counts that launch. The reported guesses per
+second are for this tiny synthetic `u64` hash, not Bitcoin private-key checks.
+
 Toy OpenCL tuning flags:
 
 ```text
@@ -213,6 +219,30 @@ Toy OpenCL tuning flags:
 The global work-item count must be a multiple of the local work-item count. If
 the binary was not compiled with `--features opencl-toy`, toy mode still runs on
 CPU/CUDA and prints a message explaining how to enable OpenCL.
+
+### Full OpenCL Key Benchmark
+
+For a more honest OpenCL number, use the full key benchmark instead of
+`--toy-benchmark`:
+
+```bash
+cargo build --release --features opencl-toy
+./target/release/satoshi-guesser --opencl-key-benchmark
+```
+
+This mode runs only OpenCL GPU workers. For each counted key, the OpenCL kernel
+derives deterministic private-key material, performs secp256k1 generator scalar
+multiplication, serializes a compressed public key, computes SHA-256 and
+RIPEMD-160, and compares the resulting HASH160 to a synthetic in-program target.
+It prints `opencl_key_stats` every 5 seconds:
+
+```text
+opencl_key_stats elapsed=5s total_keys=... keys_per_second=... average_keys_per_second=...
+```
+
+This benchmark is intentionally much slower than the synthetic `u64` toy hash
+benchmark. The implementation favors an honest full calculation over pretending
+tiny hashes are Bitcoin key guesses.
 
 ## Data
 

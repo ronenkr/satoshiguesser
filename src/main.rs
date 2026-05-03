@@ -20,6 +20,9 @@ use std::{
     ptr,
 };
 
+#[cfg(feature = "opencl-toy")]
+const OPENCL_KEY_BENCHMARK_KERNEL: &str = include_str!("../opencl/key_benchmark.cl");
+
 const EMBEDDED_WALLETS: &str = include_str!("../data/wallets.csv");
 const DEFAULT_STATS_SECONDS: u64 = 5;
 const DEFAULT_SUCCESS_FILE: &str = "satoshi-guesser-success.txt";
@@ -30,6 +33,8 @@ const DEFAULT_TOY_CUDA_ITERS: u32 = 256;
 const DEFAULT_TOY_OPENCL_GLOBAL_WORK_ITEMS: usize = 262_144;
 const DEFAULT_TOY_OPENCL_LOCAL_WORK_ITEMS: usize = 256;
 const DEFAULT_TOY_OPENCL_ITERS: u32 = 256;
+const SYNTHETIC_OPENCL_TARGET_HASH160: [u32; 5] =
+    [0x89abcdef, 0x01234567, 0xfedcba98, 0x76543210, 0x0badc0de];
 const SATS_PER_BTC: u64 = 100_000_000;
 
 #[derive(Clone, Debug)]
@@ -40,6 +45,7 @@ struct Args {
     success_file: String,
     compressed: bool,
     uncompressed: bool,
+    opencl_key_benchmark: bool,
     toy_gpu_demo: bool,
     toy_benchmark: bool,
     toy_target_nonce: u64,
@@ -104,6 +110,11 @@ fn main() {
         eprintln!();
         print_usage_and_exit(2);
     });
+
+    if args.opencl_key_benchmark {
+        run_opencl_key_benchmark(args);
+        return;
+    }
 
     if args.toy_gpu_demo {
         run_toy_gpu_demo(args);
@@ -211,6 +222,93 @@ fn main() {
                 last_total = total;
             }
             Err(mpsc::RecvTimeoutError::Disconnected) => break,
+        }
+    }
+
+    stop.store(true, AtomicOrdering::Relaxed);
+    for worker in workers {
+        let _ = worker.join();
+    }
+}
+
+fn run_opencl_key_benchmark(args: Args) {
+    if !toy_opencl_compiled() {
+        eprintln!(
+            "opencl_key_benchmark_status=not_compiled build with: cargo build --release --features opencl-toy"
+        );
+        process::exit(1);
+    }
+
+    let opencl_devices = toy_opencl_devices();
+    if opencl_devices.is_empty() {
+        eprintln!("opencl_key_benchmark_status=no_opencl_gpu_devices_found");
+        process::exit(1);
+    }
+
+    eprintln!(
+        "opencl_key_benchmark target_hash160={} opencl_devices={} global_work_items={} local_work_items={} iterations_per_item={}",
+        synthetic_opencl_target_hash160_hex(),
+        opencl_devices.len(),
+        args.toy_opencl_global,
+        args.toy_opencl_local,
+        args.toy_opencl_iters
+    );
+    for device in &opencl_devices {
+        eprintln!(
+            "opencl_key_device platform={} device={} name={}",
+            device.platform_index, device.device_index, device.name
+        );
+    }
+
+    let total_guesses = Arc::new(AtomicU64::new(0));
+    let stop = Arc::new(AtomicBool::new(false));
+    let mut workers = Vec::with_capacity(opencl_devices.len());
+    let total_lanes = opencl_devices.len() as u64;
+
+    for (lane, device) in opencl_devices.into_iter().enumerate() {
+        let worker_total = Arc::clone(&total_guesses);
+        let worker_stop = Arc::clone(&stop);
+        let global_work_items = args.toy_opencl_global;
+        let local_work_items = args.toy_opencl_local;
+        let iterations_per_item = args.toy_opencl_iters;
+        workers.push(thread::spawn(move || {
+            run_opencl_key_benchmark_worker(
+                device,
+                lane as u64,
+                total_lanes,
+                global_work_items,
+                local_work_items,
+                iterations_per_item,
+                worker_total,
+                worker_stop,
+            );
+        }));
+    }
+
+    let started = Instant::now();
+    let mut last_tick = started;
+    let mut last_total = 0_u64;
+    let interval = Duration::from_secs(args.stats_seconds);
+
+    loop {
+        thread::sleep(interval);
+        let now = Instant::now();
+        let total = total_guesses.load(AtomicOrdering::Relaxed);
+        let elapsed = now.duration_since(started).as_secs_f64();
+        let tick_elapsed = now.duration_since(last_tick).as_secs_f64();
+        let interval_guesses = total.saturating_sub(last_total);
+        let interval_rate = interval_guesses as f64 / tick_elapsed;
+        let average_rate = total as f64 / elapsed.max(f64::EPSILON);
+        println!(
+            "opencl_key_stats elapsed={:.0}s total_keys={} keys_per_second={:.0} average_keys_per_second={:.0}",
+            elapsed, total, interval_rate, average_rate
+        );
+        last_tick = now;
+        last_total = total;
+
+        if workers.iter().all(|worker| worker.is_finished()) {
+            eprintln!("opencl_key_benchmark_status=all_workers_stopped");
+            break;
         }
     }
 
@@ -505,6 +603,7 @@ fn run_toy_opencl_worker(
             global_work_items,
             local_work_items,
             iterations_per_item,
+            !report_hits,
         ) {
             Ok((Some(nonce), searched)) => {
                 total_guesses.fetch_add(searched, AtomicOrdering::Relaxed);
@@ -521,6 +620,40 @@ fn run_toy_opencl_worker(
             Err(err) => {
                 eprintln!(
                     "toy_opencl_error platform={} device={} error={err}",
+                    device.platform_index, device.device_index
+                );
+                break;
+            }
+        }
+    }
+}
+
+fn run_opencl_key_benchmark_worker(
+    device: ToyOpenClDevice,
+    mut base: u64,
+    stride: u64,
+    global_work_items: usize,
+    local_work_items: usize,
+    iterations_per_item: u32,
+    total_guesses: Arc<AtomicU64>,
+    stop: Arc<AtomicBool>,
+) {
+    while !stop.load(AtomicOrdering::Relaxed) {
+        match opencl_key_benchmark_device(
+            &device,
+            base,
+            stride,
+            global_work_items,
+            local_work_items,
+            iterations_per_item,
+        ) {
+            Ok(searched) => {
+                total_guesses.fetch_add(searched, AtomicOrdering::Relaxed);
+                base = base.wrapping_add(searched.wrapping_mul(stride));
+            }
+            Err(err) => {
+                eprintln!(
+                    "opencl_key_error platform={} device={} error={err}",
                     device.platform_index, device.device_index
                 );
                 break;
@@ -802,11 +935,24 @@ __kernel void toy_search(
     ulong stride,
     ulong target_hash,
     uint iterations_per_item,
+    uint benchmark_mode,
     __global ulong* found_nonce,
-    __global uint* found_flag
+    __global uint* found_flag,
+    __global ulong* checksum_out
 ) {
     ulong gid = (ulong)get_global_id(0);
     ulong work_size = (ulong)get_global_size(0);
+
+    if (benchmark_mode != 0u) {
+        ulong acc = base ^ stride ^ target_hash ^ gid;
+        for (uint i = 0; i < iterations_per_item; i++) {
+            ulong nonce = base + (gid + ((ulong)i * work_size)) * stride;
+            ulong hash = toy_hash_ulong(nonce);
+            acc ^= hash + 0x9e3779b97f4a7c15UL + (acc << 6) + (acc >> 2);
+        }
+        checksum_out[gid] = acc;
+        return;
+    }
 
     for (uint i = 0; i < iterations_per_item; i++) {
         ulong nonce = base + (gid + ((ulong)i * work_size)) * stride;
@@ -990,6 +1136,7 @@ fn toy_opencl_search_device(
     global_work_items: usize,
     local_work_items: usize,
     iterations_per_item: u32,
+    benchmark_mode: bool,
 ) -> Result<(Option<u64>, u64), String> {
     let device_id = opencl_device_by_index(device.platform_index, device.device_index)?;
     let source = CString::new(OPENCL_TOY_KERNEL).expect("OpenCL source has no interior NUL");
@@ -1091,10 +1238,33 @@ fn toy_opencl_search_device(
         return Err(format!("clCreateBuffer(found_flag) failed: {status}"));
     }
 
+    let checksum_buf = unsafe {
+        clCreateBuffer(
+            context,
+            CL_MEM_READ_WRITE,
+            global_work_items.saturating_mul(std::mem::size_of::<u64>()),
+            ptr::null_mut(),
+            &mut status,
+        )
+    };
+    if status != CL_SUCCESS || checksum_buf.is_null() {
+        unsafe {
+            clReleaseMemObject(found_flag_buf);
+            clReleaseMemObject(found_nonce_buf);
+            clReleaseKernel(kernel);
+            clReleaseProgram(program);
+            clReleaseCommandQueue(queue);
+            clReleaseContext(context);
+        }
+        return Err(format!("clCreateBuffer(checksum) failed: {status}"));
+    }
+
     let zero_nonce = 0_u64;
     let zero_flag = 0_u32;
     let mut found_nonce = 0_u64;
     let mut found_flag = 0_u32;
+    let mut checksum_sample = 0_u64;
+    let benchmark_mode_flag = u32::from(benchmark_mode);
     let search_result = unsafe {
         check_opencl(
             clEnqueueWriteBuffer(
@@ -1129,8 +1299,10 @@ fn toy_opencl_search_device(
         set_opencl_arg(kernel, 1, &stride)?;
         set_opencl_arg(kernel, 2, &target_hash)?;
         set_opencl_arg(kernel, 3, &iterations_per_item)?;
-        set_opencl_arg(kernel, 4, &found_nonce_buf)?;
-        set_opencl_arg(kernel, 5, &found_flag_buf)?;
+        set_opencl_arg(kernel, 4, &benchmark_mode_flag)?;
+        set_opencl_arg(kernel, 5, &found_nonce_buf)?;
+        set_opencl_arg(kernel, 6, &found_flag_buf)?;
+        set_opencl_arg(kernel, 7, &checksum_buf)?;
 
         let global = [global_work_items];
         let local = [local_work_items];
@@ -1150,37 +1322,55 @@ fn toy_opencl_search_device(
         )?;
         check_opencl(clFinish(queue), "clFinish")?;
 
-        check_opencl(
-            clEnqueueReadBuffer(
-                queue,
-                found_nonce_buf,
-                CL_TRUE,
-                0,
-                std::mem::size_of::<u64>(),
-                &mut found_nonce as *mut u64 as *mut c_void,
-                0,
-                ptr::null(),
-                ptr::null_mut(),
-            ),
-            "clEnqueueReadBuffer(found_nonce)",
-        )?;
-        check_opencl(
-            clEnqueueReadBuffer(
-                queue,
-                found_flag_buf,
-                CL_TRUE,
-                0,
-                std::mem::size_of::<c_uint>(),
-                &mut found_flag as *mut u32 as *mut c_void,
-                0,
-                ptr::null(),
-                ptr::null_mut(),
-            ),
-            "clEnqueueReadBuffer(found_flag)",
-        )
+        if benchmark_mode {
+            check_opencl(
+                clEnqueueReadBuffer(
+                    queue,
+                    checksum_buf,
+                    CL_TRUE,
+                    0,
+                    std::mem::size_of::<u64>(),
+                    &mut checksum_sample as *mut u64 as *mut c_void,
+                    0,
+                    ptr::null(),
+                    ptr::null_mut(),
+                ),
+                "clEnqueueReadBuffer(checksum)",
+            )
+        } else {
+            check_opencl(
+                clEnqueueReadBuffer(
+                    queue,
+                    found_nonce_buf,
+                    CL_TRUE,
+                    0,
+                    std::mem::size_of::<u64>(),
+                    &mut found_nonce as *mut u64 as *mut c_void,
+                    0,
+                    ptr::null(),
+                    ptr::null_mut(),
+                ),
+                "clEnqueueReadBuffer(found_nonce)",
+            )?;
+            check_opencl(
+                clEnqueueReadBuffer(
+                    queue,
+                    found_flag_buf,
+                    CL_TRUE,
+                    0,
+                    std::mem::size_of::<c_uint>(),
+                    &mut found_flag as *mut u32 as *mut c_void,
+                    0,
+                    ptr::null(),
+                    ptr::null_mut(),
+                ),
+                "clEnqueueReadBuffer(found_flag)",
+            )
+        }
     };
 
     unsafe {
+        clReleaseMemObject(checksum_buf);
         clReleaseMemObject(found_flag_buf);
         clReleaseMemObject(found_nonce_buf);
         clReleaseKernel(kernel);
@@ -1189,6 +1379,7 @@ fn toy_opencl_search_device(
         clReleaseContext(context);
     }
     search_result?;
+    std::hint::black_box(checksum_sample);
 
     let searched = (global_work_items as u64).saturating_mul(iterations_per_item as u64);
     if found_flag != 0 {
@@ -1207,7 +1398,169 @@ fn toy_opencl_search_device(
     _global_work_items: usize,
     _local_work_items: usize,
     _iterations_per_item: u32,
+    _benchmark_mode: bool,
 ) -> Result<(Option<u64>, u64), String> {
+    Err("opencl-toy feature is not compiled".to_owned())
+}
+
+#[cfg(feature = "opencl-toy")]
+fn opencl_key_benchmark_device(
+    device: &ToyOpenClDevice,
+    base: u64,
+    stride: u64,
+    global_work_items: usize,
+    local_work_items: usize,
+    iterations_per_item: u32,
+) -> Result<u64, String> {
+    let device_id = opencl_device_by_index(device.platform_index, device.device_index)?;
+    let source =
+        CString::new(OPENCL_KEY_BENCHMARK_KERNEL).expect("OpenCL source has no interior NUL");
+    let kernel_name = CString::new("key_benchmark").expect("kernel name has no interior NUL");
+
+    let mut status = CL_SUCCESS;
+    let context = unsafe {
+        clCreateContext(
+            ptr::null(),
+            1,
+            &device_id,
+            None,
+            ptr::null_mut(),
+            &mut status,
+        )
+    };
+    if status != CL_SUCCESS || context.is_null() {
+        return Err(format!("clCreateContext failed: {status}"));
+    }
+
+    let queue = unsafe { clCreateCommandQueue(context, device_id, 0, &mut status) };
+    if status != CL_SUCCESS || queue.is_null() {
+        unsafe {
+            clReleaseContext(context);
+        }
+        return Err(format!("clCreateCommandQueue failed: {status}"));
+    }
+
+    let source_ptr = source.as_ptr();
+    let source_len = OPENCL_KEY_BENCHMARK_KERNEL.len();
+    let program =
+        unsafe { clCreateProgramWithSource(context, 1, &source_ptr, &source_len, &mut status) };
+    if status != CL_SUCCESS || program.is_null() {
+        unsafe {
+            clReleaseCommandQueue(queue);
+            clReleaseContext(context);
+        }
+        return Err(format!("clCreateProgramWithSource failed: {status}"));
+    }
+
+    let build_status =
+        unsafe { clBuildProgram(program, 1, &device_id, ptr::null(), None, ptr::null_mut()) };
+    if build_status != CL_SUCCESS {
+        let log = opencl_build_log(program, device_id);
+        unsafe {
+            clReleaseProgram(program);
+            clReleaseCommandQueue(queue);
+            clReleaseContext(context);
+        }
+        return Err(format!("clBuildProgram failed: {build_status}: {log}"));
+    }
+
+    let kernel = unsafe { clCreateKernel(program, kernel_name.as_ptr(), &mut status) };
+    if status != CL_SUCCESS || kernel.is_null() {
+        unsafe {
+            clReleaseProgram(program);
+            clReleaseCommandQueue(queue);
+            clReleaseContext(context);
+        }
+        return Err(format!("clCreateKernel failed: {status}"));
+    }
+
+    let checksum_buf = unsafe {
+        clCreateBuffer(
+            context,
+            CL_MEM_READ_WRITE,
+            global_work_items.saturating_mul(std::mem::size_of::<u64>()),
+            ptr::null_mut(),
+            &mut status,
+        )
+    };
+    if status != CL_SUCCESS || checksum_buf.is_null() {
+        unsafe {
+            clReleaseKernel(kernel);
+            clReleaseProgram(program);
+            clReleaseCommandQueue(queue);
+            clReleaseContext(context);
+        }
+        return Err(format!("clCreateBuffer(checksum) failed: {status}"));
+    }
+
+    let target = SYNTHETIC_OPENCL_TARGET_HASH160;
+    let mut checksum_sample = 0_u64;
+    let benchmark_result = unsafe {
+        set_opencl_arg(kernel, 0, &base)?;
+        set_opencl_arg(kernel, 1, &stride)?;
+        set_opencl_arg(kernel, 2, &target[0])?;
+        set_opencl_arg(kernel, 3, &target[1])?;
+        set_opencl_arg(kernel, 4, &target[2])?;
+        set_opencl_arg(kernel, 5, &target[3])?;
+        set_opencl_arg(kernel, 6, &target[4])?;
+        set_opencl_arg(kernel, 7, &iterations_per_item)?;
+        set_opencl_arg(kernel, 8, &checksum_buf)?;
+
+        let global = [global_work_items];
+        let local = [local_work_items];
+        check_opencl(
+            clEnqueueNDRangeKernel(
+                queue,
+                kernel,
+                1,
+                ptr::null(),
+                global.as_ptr(),
+                local.as_ptr(),
+                0,
+                ptr::null(),
+                ptr::null_mut(),
+            ),
+            "clEnqueueNDRangeKernel",
+        )?;
+        check_opencl(clFinish(queue), "clFinish")?;
+        check_opencl(
+            clEnqueueReadBuffer(
+                queue,
+                checksum_buf,
+                CL_TRUE,
+                0,
+                std::mem::size_of::<u64>(),
+                &mut checksum_sample as *mut u64 as *mut c_void,
+                0,
+                ptr::null(),
+                ptr::null_mut(),
+            ),
+            "clEnqueueReadBuffer(checksum)",
+        )
+    };
+
+    unsafe {
+        clReleaseMemObject(checksum_buf);
+        clReleaseKernel(kernel);
+        clReleaseProgram(program);
+        clReleaseCommandQueue(queue);
+        clReleaseContext(context);
+    }
+    benchmark_result?;
+    std::hint::black_box(checksum_sample);
+
+    Ok((global_work_items as u64).saturating_mul(iterations_per_item as u64))
+}
+
+#[cfg(not(feature = "opencl-toy"))]
+fn opencl_key_benchmark_device(
+    _device: &ToyOpenClDevice,
+    _base: u64,
+    _stride: u64,
+    _global_work_items: usize,
+    _local_work_items: usize,
+    _iterations_per_item: u32,
+) -> Result<u64, String> {
     Err("opencl-toy feature is not compiled".to_owned())
 }
 
@@ -1579,6 +1932,7 @@ fn parse_args() -> Result<Args, String> {
     let mut success_file = DEFAULT_SUCCESS_FILE.to_owned();
     let mut compressed = true;
     let mut uncompressed = true;
+    let mut opencl_key_benchmark = false;
     let mut toy_gpu_demo = false;
     let mut toy_benchmark = false;
     let mut toy_target_nonce = DEFAULT_TOY_TARGET_NONCE;
@@ -1622,6 +1976,9 @@ fn parse_args() -> Result<Args, String> {
             "--uncompressed-only" => {
                 compressed = false;
                 uncompressed = true;
+            }
+            "--opencl-key-benchmark" => {
+                opencl_key_benchmark = true;
             }
             "--toy-gpu-demo" => {
                 toy_gpu_demo = true;
@@ -1703,6 +2060,7 @@ fn parse_args() -> Result<Args, String> {
         success_file,
         compressed,
         uncompressed,
+        opencl_key_benchmark,
         toy_gpu_demo,
         toy_benchmark,
         toy_target_nonce,
@@ -1720,9 +2078,21 @@ fn next_arg(iter: &mut impl Iterator<Item = String>, flag: &str) -> Result<Strin
         .ok_or_else(|| format!("{flag} requires a value"))
 }
 
+fn synthetic_opencl_target_hash160_hex() -> String {
+    let mut bytes = [0_u8; 20];
+    for (word_index, word) in SYNTHETIC_OPENCL_TARGET_HASH160.iter().enumerate() {
+        let start = word_index * 4;
+        bytes[start] = (*word & 0xff) as u8;
+        bytes[start + 1] = ((*word >> 8) & 0xff) as u8;
+        bytes[start + 2] = ((*word >> 16) & 0xff) as u8;
+        bytes[start + 3] = ((*word >> 24) & 0xff) as u8;
+    }
+    to_hex(&bytes)
+}
+
 fn print_usage_and_exit(code: i32) -> ! {
     eprintln!(
-        "Usage: satoshi-guesser [--threads N] [--stats-seconds N] [--targets wallets.csv] [--success-file path] [--compressed-only|--uncompressed-only] [--toy-gpu-demo] [--toy-benchmark] [--toy-target-nonce N] [--toy-cuda-blocks N] [--toy-cuda-threads N] [--toy-cuda-iters N] [--toy-opencl-global N] [--toy-opencl-local N] [--toy-opencl-iters N]"
+        "Usage: satoshi-guesser [--threads N] [--stats-seconds N] [--targets wallets.csv] [--success-file path] [--compressed-only|--uncompressed-only] [--opencl-key-benchmark] [--toy-gpu-demo] [--toy-benchmark] [--toy-target-nonce N] [--toy-cuda-blocks N] [--toy-cuda-threads N] [--toy-cuda-iters N] [--toy-opencl-global N] [--toy-opencl-local N] [--toy-opencl-iters N]"
     );
     process::exit(code);
 }
