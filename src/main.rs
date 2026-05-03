@@ -791,18 +791,13 @@ __kernel void toy_search(
     __global uint* found_flag
 ) {
     ulong gid = (ulong)get_global_id(0);
-    ulong global = (ulong)get_global_size(0);
+    ulong work_size = (ulong)get_global_size(0);
 
     for (uint i = 0; i < iterations_per_item; i++) {
-        if (*found_flag != 0u) {
-            return;
-        }
-
-        ulong nonce = base + (gid + ((ulong)i * global)) * stride;
+        ulong nonce = base + (gid + ((ulong)i * work_size)) * stride;
         if (toy_hash_ulong(nonce) == target_hash) {
-            if (atomic_cmpxchg((volatile __global unsigned int*)found_flag, 0u, 1u) == 0u) {
-                *found_nonce = nonce;
-            }
+            *found_nonce = nonce;
+            *found_flag = 1u;
             return;
         }
     }
