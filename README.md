@@ -15,13 +15,38 @@ Requires a recent stable Rust toolchain.
 cargo build --release
 ```
 
-Release builds use `target-cpu=native`, so build on the server that will run the
-binary. That lets LLVM emit instructions for available CPU features such as
-AVX2, SSE4.1, SHA-NI, and their ARM equivalents. On non-MSVC targets, the
-`sha2` assembly backend is also enabled for SHA acceleration; MSVC builds use
-RustCrypto's runtime-detected SHA intrinsics instead. The wallet CSV is embedded
-into the binary at compile time by default, so the release executable does not
-need extra data files.
+Release builds use target-specific CPU tuning from `.cargo/config.toml`. x86_64
+Linux, Windows, and Intel macOS builds use `target-cpu=native`; Apple Silicon
+builds use an Apple ARM profile with NEON, AES, SHA2/SHA3, CRC, LSE, dot-product,
+and FP16 enabled. On non-MSVC targets, the `sha2` assembly backend is also
+enabled for SHA acceleration, including its Apple AArch64 SHA-256 assembly path;
+MSVC builds use RustCrypto's runtime-detected SHA intrinsics instead. The wallet
+CSV is embedded into the binary at compile time by default, so the release
+executable does not need extra data files.
+
+### Apple Silicon
+
+On an M-series Mac, build normally:
+
+```bash
+cargo build --release
+```
+
+The `.cargo/config.toml` file enables an Apple Silicon CPU profile plus ARM
+SIMD/crypto features. The `sha2` backend uses its Apple AArch64 assembly
+implementation. At startup, Apple Silicon builds report detected SIMD/crypto
+features, for example:
+
+```text
+cpu_features=apple-silicon,neon,aes,sha2,sha3,crc,lse,dotprod,fp16
+```
+
+If you are cross-compiling a portable macOS binary from another machine, remove
+or override the `aarch64-apple-darwin` section in `.cargo/config.toml`.
+
+For maximum tuning on the exact M-series machine you are building on, you can
+temporarily change the Apple target CPU in `.cargo/config.toml` from `apple-m1`
+to `native`.
 
 ## Run
 
@@ -47,6 +72,9 @@ At startup it also prints detected CPU features, for example:
 ```text
 loaded 21954 targets (... BTC); starting 32 worker threads; cpu_features=sse2,ssse3,sse4.1,avx2,sha-ni
 ```
+
+On Apple Silicon this line reports ARM features such as `neon`, `aes`, `sha2`,
+`sha3`, `crc`, `lse`, `dotprod`, and `fp16`.
 
 Useful options:
 
@@ -130,6 +158,9 @@ Toy CUDA tuning flags:
 
 If the binary was not compiled with `--features cuda-toy`, the toy mode still
 runs on CPU and prints a message explaining how to enable CUDA.
+
+CUDA is NVIDIA-only and is not available on Apple Silicon. The synthetic toy
+mode still runs on Apple CPUs and benefits from native ARM code generation.
 
 ## Data
 

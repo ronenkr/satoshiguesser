@@ -669,11 +669,32 @@ fn cpu_feature_summary() -> String {
 #[cfg(target_arch = "aarch64")]
 fn cpu_feature_summary() -> String {
     let mut features = Vec::new();
+    if cfg!(target_vendor = "apple") && cfg!(target_os = "macos") {
+        features.push("apple-silicon");
+    }
     if std::arch::is_aarch64_feature_detected!("neon") {
         features.push("neon");
     }
+    if std::arch::is_aarch64_feature_detected!("aes") {
+        features.push("aes");
+    }
     if std::arch::is_aarch64_feature_detected!("sha2") {
         features.push("sha2");
+    }
+    if std::arch::is_aarch64_feature_detected!("sha3") {
+        features.push("sha3");
+    }
+    if std::arch::is_aarch64_feature_detected!("crc") {
+        features.push("crc");
+    }
+    if std::arch::is_aarch64_feature_detected!("lse") {
+        features.push("lse");
+    }
+    if std::arch::is_aarch64_feature_detected!("dotprod") {
+        features.push("dotprod");
+    }
+    if std::arch::is_aarch64_feature_detected!("fp16") {
+        features.push("fp16");
     }
 
     if features.is_empty() {
